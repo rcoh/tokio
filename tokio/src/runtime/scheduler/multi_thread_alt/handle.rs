@@ -9,9 +9,9 @@ use crate::util::RngSeedGenerator;
 
 use std::fmt;
 
-cfg_metrics! {
-    mod metrics;
-}
+//cfg_metrics! {
+mod metrics;
+//}
 
 /// Handle to the multi thread scheduler
 pub(crate) struct Handle {

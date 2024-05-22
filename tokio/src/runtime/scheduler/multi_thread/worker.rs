@@ -74,9 +74,9 @@ use std::cell::RefCell;
 use std::task::Waker;
 use std::time::Duration;
 
-cfg_metrics! {
-    mod metrics;
-}
+//cfg_unstable_metrics! {
+mod metrics;
+//}
 
 cfg_taskdump! {
     mod taskdump;

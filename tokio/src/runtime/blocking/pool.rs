@@ -40,7 +40,8 @@ impl SpawnerMetrics {
         self.num_idle_threads.load(Ordering::Relaxed)
     }
 
-    cfg_metrics! {
+    // TODO(rcoh): why is this gated?
+    cfg_unstable_metrics! {
         fn queue_depth(&self) -> usize {
             self.queue_depth.load(Ordering::Relaxed)
         }
@@ -474,7 +475,7 @@ impl Spawner {
     }
 }
 
-cfg_metrics! {
+cfg_unstable_metrics! {
     impl Spawner {
         pub(crate) fn num_threads(&self) -> usize {
             self.inner.metrics.num_threads()

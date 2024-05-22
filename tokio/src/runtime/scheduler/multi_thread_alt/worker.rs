@@ -74,9 +74,9 @@ use std::cmp;
 use std::task::Waker;
 use std::time::Duration;
 
-cfg_metrics! {
-    mod metrics;
-}
+//cfg_metrics! {
+mod metrics;
+//}
 
 mod taskdump_mock;
 
