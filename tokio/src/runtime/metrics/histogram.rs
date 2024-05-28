@@ -8,6 +8,7 @@ use std::ops::Range;
 pub(crate) struct Histogram {
     /// The histogram buckets
     buckets: Box<[MetricAtomicU64]>,
+    buckets: Box<[MetricAtomicU64]>,
 
     /// Bucket scale, linear or log
     scale: HistogramScale,
@@ -54,6 +55,10 @@ impl Histogram {
         self.buckets.len()
     }
 
+    cfg_64bit_metrics! {
+        pub(crate) fn get(&self, bucket: usize) -> u64 {
+            self.buckets[bucket].load(Relaxed)
+        }
     cfg_64bit_metrics! {
         pub(crate) fn get(&self, bucket: usize) -> u64 {
             self.buckets[bucket].load(Relaxed)
@@ -154,6 +159,7 @@ impl HistogramBuilder {
         Histogram {
             buckets: (0..self.num_buckets)
                 .map(|_| MetricAtomicU64::new(0))
+                .map(|_| MetricAtomicU64::new(0))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             resolution,
@@ -168,6 +174,7 @@ impl Default for HistogramBuilder {
     }
 }
 
+#[cfg(all(test, target_has_atomic = "64"))]
 #[cfg(all(test, target_has_atomic = "64"))]
 mod test {
     use super::*;
