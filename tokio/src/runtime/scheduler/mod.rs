@@ -173,6 +173,10 @@ cfg_rt! {
                 Handle::MultiThreadAlt(handle) => handle.num_workers(),
             }
         }
+
+        pub(crate) fn active_tasks_count(&self) -> usize {
+            match_flavor!(self, Handle(handle) => handle.active_tasks_count())
+        }
     }
 
     cfg_unstable_metrics! {
@@ -187,9 +191,6 @@ cfg_rt! {
                 match_flavor!(self, Handle(handle) => handle.num_idle_blocking_threads())
             }
 
-            pub(crate) fn active_tasks_count(&self) -> usize {
-                match_flavor!(self, Handle(handle) => handle.active_tasks_count())
-            }
 
             pub(crate) fn scheduler_metrics(&self) -> &SchedulerMetrics {
                 match_flavor!(self, Handle(handle) => handle.scheduler_metrics())

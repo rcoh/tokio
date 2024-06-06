@@ -47,6 +47,25 @@ impl RuntimeMetrics {
         self.handle.inner.num_workers()
     }
 
+    /// Returns the number of active tasks in the runtime.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::runtime::Handle;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///    let metrics = Handle::current().metrics();
+    ///
+    ///     let n = metrics.active_tasks_count();
+    ///     println!("Runtime has {} active tasks", n);
+    /// }
+    /// ```
+    pub fn active_tasks_count(&self) -> usize {
+        self.handle.inner.active_tasks_count()
+    }
+
     cfg_unstable_metrics! {
 
         /// Returns the number of additional threads spawned by the runtime.
@@ -73,25 +92,6 @@ impl RuntimeMetrics {
         /// ```
         pub fn num_blocking_threads(&self) -> usize {
             self.handle.inner.num_blocking_threads()
-        }
-
-        /// Returns the number of active tasks in the runtime.
-        ///
-        /// # Examples
-        ///
-        /// ```
-        /// use tokio::runtime::Handle;
-        ///
-        /// #[tokio::main]
-        /// async fn main() {
-        ///    let metrics = Handle::current().metrics();
-        ///
-        ///     let n = metrics.active_tasks_count();
-        ///     println!("Runtime has {} active tasks", n);
-        /// }
-        /// ```
-        pub fn active_tasks_count(&self) -> usize {
-            self.handle.inner.active_tasks_count()
         }
 
         /// Returns the number of idle threads, which have spawned by the runtime

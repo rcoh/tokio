@@ -9,6 +9,10 @@ impl Handle {
         self.shared.worker_metrics.len()
     }
 
+    pub(crate) fn active_tasks_count(&self) -> usize {
+        self.shared.owned.active_tasks_count()
+    }
+
     cfg_unstable_metrics! {
         pub(crate) fn num_blocking_threads(&self) -> usize {
             // workers are currently spawned using spawn_blocking
@@ -21,9 +25,6 @@ impl Handle {
             self.blocking_spawner.num_idle_threads()
         }
 
-        pub(crate) fn active_tasks_count(&self) -> usize {
-            self.shared.owned.active_tasks_count()
-        }
 
         pub(crate) fn scheduler_metrics(&self) -> &SchedulerMetrics {
             &self.shared.scheduler_metrics
