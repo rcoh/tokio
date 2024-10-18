@@ -372,6 +372,9 @@ cfg_rt! {
 
         pub use self::builder::UnhandledPanic;
         pub use crate::util::rand::RngSeed;
+
+        mod local_runtime;
+        pub use local_runtime::{LocalRuntime, LocalOptions};
     }
 
     cfg_taskdump! {
@@ -407,7 +410,7 @@ cfg_rt! {
     pub use metrics::RuntimeMetrics;
 
     cfg_unstable_metrics! {
-        pub use metrics::HistogramScale;
+        pub use metrics::{HistogramScale, HistogramConfiguration, LogHistogram, LogHistogramBuilder, InvalidHistogramConfiguration} ;
 
         cfg_net! {
             pub(crate) use metrics::IoDriverMetrics;

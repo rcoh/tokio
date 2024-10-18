@@ -1,13 +1,16 @@
 #![cfg_attr(loom, allow(unused_imports))]
 
 use crate::runtime::handle::Handle;
-#[cfg(tokio_unstable)]
-use crate::runtime::TaskMeta;
 use crate::runtime::{blocking, driver, Callback, HistogramBuilder, Runtime, TaskCallback};
+#[cfg(tokio_unstable)]
+use crate::runtime::{metrics::HistogramConfiguration, LocalOptions, LocalRuntime, TaskMeta};
 use crate::util::rand::{RngSeed, RngSeedGenerator};
 
+use crate::runtime::blocking::BlockingPool;
+use crate::runtime::scheduler::CurrentThread;
 use std::fmt;
 use std::io;
+use std::thread::ThreadId;
 use std::time::Duration;
 
 /// Builds Tokio Runtime with custom configuration values.
@@ -800,6 +803,37 @@ impl Builder {
         }
     }
 
+    /// Creates the configured `LocalRuntime`.
+    ///
+    /// The returned `LocalRuntime` instance is ready to spawn tasks.
+    ///
+    /// # Panics
+    /// This will panic if `current_thread` is not the selected runtime flavor.
+    /// All other runtime flavors are unsupported by [`LocalRuntime`].
+    ///
+    /// [`LocalRuntime`]: [crate::runtime::LocalRuntime]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::runtime::Builder;
+    ///
+    /// let rt  = Builder::new_current_thread().build_local(&mut Default::default()).unwrap();
+    ///
+    /// rt.block_on(async {
+    ///     println!("Hello from the Tokio runtime");
+    /// });
+    /// ```
+    #[allow(unused_variables, unreachable_patterns)]
+    #[cfg(tokio_unstable)]
+    #[cfg_attr(docsrs, doc(cfg(tokio_unstable)))]
+    pub fn build_local(&mut self, options: &LocalOptions) -> io::Result<LocalRuntime> {
+        match &self.kind {
+            Kind::CurrentThread => self.build_current_thread_local_runtime(),
+            _ => panic!("Only current_thread is supported when building a local runtime"),
+        }
+    }
+
     fn get_cfg(&self, workers: usize) -> driver::Cfg {
         driver::Cfg {
             enable_pause_time: match self.kind {
@@ -1068,6 +1102,11 @@ impl Builder {
         /// `metrics_poll_count_histogram_` builder methods to configure the
         /// histogram details.
         ///
+        /// By default, a linear histogram with 10 buckets each 100 microseconds wide will be used.
+        /// This has an extremely low memory footprint, but may not provide enough granularity. For
+        /// better granularity with low memory usage, use [`metrics_poll_count_histogram_configuration()`]
+        /// to select [`LogHistogram`] instead.
+        ///
         /// # Examples
         ///
         /// ```
@@ -1087,6 +1126,8 @@ impl Builder {
         ///
         /// [`Handle::metrics()`]: crate::runtime::Handle::metrics
         /// [`Instant::now()`]: std::time::Instant::now
+        /// [`LogHistogram`]: crate::runtime::LogHistogram
+        /// [`metrics_poll_count_histogram_configuration()`]: Builder::metrics_poll_count_histogram_configuration
         pub fn enable_metrics_poll_count_histogram(&mut self) -> &mut Self {
             self.metrics_poll_count_histogram_enable = true;
             self
@@ -1108,14 +1149,83 @@ impl Builder {
         /// ```
         /// use tokio::runtime::{self, HistogramScale};
         ///
+        /// # #[allow(deprecated)]
         /// let rt = runtime::Builder::new_multi_thread()
         ///     .enable_metrics_poll_count_histogram()
         ///     .metrics_poll_count_histogram_scale(HistogramScale::Log)
         ///     .build()
         ///     .unwrap();
         /// ```
+        #[deprecated(note = "use metrics_poll_count_histogram_configuration")]
         pub fn metrics_poll_count_histogram_scale(&mut self, histogram_scale: crate::runtime::HistogramScale) -> &mut Self {
-            self.metrics_poll_count_histogram.scale = histogram_scale;
+            self.metrics_poll_count_histogram.legacy_mut(|b|b.scale = histogram_scale);
+            self
+        }
+
+        /// Configure the histogram for tracking poll times
+        ///
+        /// By default, a linear histogram with 10 buckets each 100 microseconds wide will be used.
+        /// This has an extremely low memory footprint, but may not provide enough granularity. For
+        /// better granularity with low memory usage, use [`LogHistogram`] instead.
+        ///
+        /// # Examples
+        /// Configure a [`LogHistogram`] with [default configuration]:
+        /// ```
+        /// use tokio::runtime;
+        /// use tokio::runtime::{HistogramConfiguration, LogHistogram};
+        ///
+        /// let rt = runtime::Builder::new_multi_thread()
+        ///     .enable_metrics_poll_count_histogram()
+        ///     .metrics_poll_count_histogram_configuration(
+        ///         HistogramConfiguration::log(LogHistogram::default())
+        ///     )
+        ///     .build()
+        ///     .unwrap();
+        /// ```
+        ///
+        /// Configure a linear histogram with 100 buckets, each 10μs wide
+        /// ```
+        /// use tokio::runtime;
+        /// use std::time::Duration;
+        /// use tokio::runtime::HistogramConfiguration;
+        ///
+        /// let rt = runtime::Builder::new_multi_thread()
+        ///     .enable_metrics_poll_count_histogram()
+        ///     .metrics_poll_count_histogram_configuration(
+        ///         HistogramConfiguration::linear(Duration::from_micros(10), 100)
+        ///     )
+        ///     .build()
+        ///     .unwrap();
+        /// ```
+        ///
+        /// Configure a [`LogHistogram`] with the following settings:
+        /// - Measure times from 100ns to 120s
+        /// - Max error of 0.1
+        /// - No more than 1024 buckets
+        /// ```
+        /// use std::time::Duration;
+        /// use tokio::runtime;
+        /// use tokio::runtime::{HistogramConfiguration, LogHistogram};
+        ///
+        /// let rt = runtime::Builder::new_multi_thread()
+        ///     .enable_metrics_poll_count_histogram()
+        ///     .metrics_poll_count_histogram_configuration(
+        ///         HistogramConfiguration::log(LogHistogram::builder()
+        ///             .max_value(Duration::from_secs(120))
+        ///             .min_value(Duration::from_nanos(100))
+        ///             .max_error(0.1)
+        ///             .max_buckets(1024)
+        ///             .expect("configuration uses 488 buckets")
+        ///         )
+        ///     )
+        ///     .build()
+        ///     .unwrap();
+        /// ```
+        ///
+        /// [`LogHistogram`]: crate::runtime::LogHistogram
+        /// [default configuration]: crate::runtime::LogHistogramBuilder
+        pub fn metrics_poll_count_histogram_configuration(&mut self, configuration: HistogramConfiguration) -> &mut Self {
+            self.metrics_poll_count_histogram.histogram_type = configuration.inner;
             self
         }
 
@@ -1139,19 +1249,22 @@ impl Builder {
         /// use tokio::runtime;
         /// use std::time::Duration;
         ///
+        /// # #[allow(deprecated)]
         /// let rt = runtime::Builder::new_multi_thread()
         ///     .enable_metrics_poll_count_histogram()
         ///     .metrics_poll_count_histogram_resolution(Duration::from_micros(100))
         ///     .build()
         ///     .unwrap();
         /// ```
+        #[deprecated(note = "use metrics_poll_count_histogram_configuration")]
         pub fn metrics_poll_count_histogram_resolution(&mut self, resolution: Duration) -> &mut Self {
             assert!(resolution > Duration::from_secs(0));
             // Sanity check the argument and also make the cast below safe.
             assert!(resolution <= Duration::from_secs(1));
 
             let resolution = resolution.as_nanos() as u64;
-            self.metrics_poll_count_histogram.resolution = resolution;
+
+            self.metrics_poll_count_histogram.legacy_mut(|b|b.resolution = resolution);
             self
         }
 
@@ -1170,14 +1283,16 @@ impl Builder {
         /// ```
         /// use tokio::runtime;
         ///
+        /// # #[allow(deprecated)]
         /// let rt = runtime::Builder::new_multi_thread()
         ///     .enable_metrics_poll_count_histogram()
         ///     .metrics_poll_count_histogram_buckets(15)
         ///     .build()
         ///     .unwrap();
         /// ```
+        #[deprecated(note = "use `metrics_poll_count_histogram_configuration")]
         pub fn metrics_poll_count_histogram_buckets(&mut self, buckets: usize) -> &mut Self {
-            self.metrics_poll_count_histogram.num_buckets = buckets;
+            self.metrics_poll_count_histogram.legacy_mut(|b|b.num_buckets = buckets);
             self
         }
     }
@@ -1191,8 +1306,40 @@ impl Builder {
     }
 
     fn build_current_thread_runtime(&mut self) -> io::Result<Runtime> {
-        use crate::runtime::scheduler::{self, CurrentThread};
-        use crate::runtime::{runtime::Scheduler, Config};
+        use crate::runtime::runtime::Scheduler;
+
+        let (scheduler, handle, blocking_pool) =
+            self.build_current_thread_runtime_components(None)?;
+
+        Ok(Runtime::from_parts(
+            Scheduler::CurrentThread(scheduler),
+            handle,
+            blocking_pool,
+        ))
+    }
+
+    #[cfg(tokio_unstable)]
+    fn build_current_thread_local_runtime(&mut self) -> io::Result<LocalRuntime> {
+        use crate::runtime::local_runtime::LocalRuntimeScheduler;
+
+        let tid = std::thread::current().id();
+
+        let (scheduler, handle, blocking_pool) =
+            self.build_current_thread_runtime_components(Some(tid))?;
+
+        Ok(LocalRuntime::from_parts(
+            LocalRuntimeScheduler::CurrentThread(scheduler),
+            handle,
+            blocking_pool,
+        ))
+    }
+
+    fn build_current_thread_runtime_components(
+        &mut self,
+        local_tid: Option<ThreadId>,
+    ) -> io::Result<(CurrentThread, Handle, BlockingPool)> {
+        use crate::runtime::scheduler;
+        use crate::runtime::Config;
 
         let (driver, driver_handle) = driver::Driver::new(self.get_cfg(1))?;
 
@@ -1227,17 +1374,14 @@ impl Builder {
                 seed_generator: seed_generator_1,
                 metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
             },
+            local_tid,
         );
 
         let handle = Handle {
             inner: scheduler::Handle::CurrentThread(handle),
         };
 
-        Ok(Runtime::from_parts(
-            Scheduler::CurrentThread(scheduler),
-            handle,
-            blocking_pool,
-        ))
+        Ok((scheduler, handle, blocking_pool))
     }
 
     fn metrics_poll_count_histogram_builder(&self) -> Option<HistogramBuilder> {
