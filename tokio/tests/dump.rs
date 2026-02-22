@@ -226,6 +226,31 @@ mod per_poll_task_dump {
 
         assert_eq!(unexpected.load(Ordering::Relaxed), 0);
     }
+
+    /// Verify that tasks make forward progress even when every poll is traced.
+    /// The harness polls twice per task run: once with capture, once normally.
+    #[test]
+    fn forward_progress_with_capture() {
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_before_task_poll(|_meta| {
+                dump::request_task_dump();
+            })
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            // This task must complete despite every poll being traced.
+            let result = tokio::spawn(async {
+                tokio::task::yield_now().await;
+                42
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(result, 42);
+        });
+    }
 }
 
 /// Regression tests for #6035.

@@ -22,18 +22,6 @@ use std::thread::ThreadId;
 use std::time::Duration;
 use std::{fmt, thread};
 
-cfg_taskdump! {
-    fn run_task_with_dump(task: task::LocalNotified<Arc<Handle>>) {
-        crate::runtime::dump::maybe_capture_task_dump(|| task.run());
-    }
-}
-
-cfg_not_taskdump! {
-    fn run_task_with_dump(task: task::LocalNotified<Arc<Handle>>) {
-        task.run();
-    }
-}
-
 /// Executes tasks on the current thread
 pub(crate) struct CurrentThread {
     /// Core scheduler data is acquired by a thread entering `block_on`.
@@ -825,7 +813,7 @@ impl CoreGuard<'_> {
                         #[cfg(tokio_unstable)]
                         context.handle.task_hooks.poll_start_callback(&task_meta);
 
-                        run_task_with_dump(task);
+                        task.run();
 
                         #[cfg(tokio_unstable)]
                         context.handle.task_hooks.poll_stop_callback(&task_meta);
