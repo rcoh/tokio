@@ -69,11 +69,7 @@ pub(crate) fn maybe_capture_task_dump<F, R>(poll_fn: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let requested = TASK_DUMP_REQUESTED.with(|r| {
-        let val = *r.borrow();
-        *r.borrow_mut() = false;
-        val
-    });
+    let requested = TASK_DUMP_REQUESTED.with(|r| r.replace(false));
 
     if requested {
         let (result, trace_inner) = super::task::trace::Trace::capture(poll_fn);
