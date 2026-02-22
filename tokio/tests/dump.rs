@@ -251,6 +251,32 @@ mod per_poll_task_dump {
             assert_eq!(result, 42);
         });
     }
+
+    /// Same as above but on the multi-thread runtime.
+    #[test]
+    fn forward_progress_with_capture_multi_thread() {
+        let rt = runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .on_before_task_poll(|_meta| {
+                dump::request_task_dump();
+            })
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let result = tokio::spawn(async {
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                42
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(result, 42);
+        });
+    }
 }
 
 /// Regression tests for #6035.

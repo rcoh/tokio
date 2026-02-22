@@ -437,7 +437,7 @@ impl<T: Future, S: Schedule> Core<T, S> {
 cfg_taskdump! {
     impl<T: Future, S: Schedule> Core<T, S> {
         /// If a per-poll task dump was requested, capture a trace by polling
-        /// the future inside [`Trace::capture`], store the trace, then return
+        /// the future inside `Trace::capture`, store the trace, then return
         /// `None` so that `poll()` continues with a normal poll for forward
         /// progress.
         ///
