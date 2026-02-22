@@ -4,7 +4,7 @@
 
 use tokio::runtime::{self, Runtime};
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 const NUM_SPAWN: usize = 1_000;
 const NUM_YIELD: usize = 10_000;
@@ -82,7 +82,7 @@ fn rt_curr_yield_many_single_task(c: &mut Criterion) {
     c.bench_function("yield_many_single_task", |b| {
         b.iter(|| {
             rt.block_on(async {
-                for _ in 0..NUM_YIELD {
+                for _ in 0..black_box(NUM_YIELD) {
                     tokio::task::yield_now().await;
                 }
             });
