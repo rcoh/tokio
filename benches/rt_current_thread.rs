@@ -4,9 +4,10 @@
 
 use tokio::runtime::{self, Runtime};
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 const NUM_SPAWN: usize = 1_000;
+const NUM_YIELD: usize = 10_000;
 
 fn rt_curr_spawn_many_local(c: &mut Criterion) {
     let rt = rt();
@@ -75,6 +76,20 @@ fn rt_curr_spawn_many_remote_busy(c: &mut Criterion) {
     });
 }
 
+fn rt_curr_yield_many_single_task(c: &mut Criterion) {
+    let rt = rt();
+
+    c.bench_function("yield_many_single_task", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                for _ in 0..black_box(NUM_YIELD) {
+                    tokio::task::yield_now().await;
+                }
+            });
+        })
+    });
+}
+
 fn rt() -> Runtime {
     runtime::Builder::new_current_thread().build().unwrap()
 }
@@ -83,7 +98,8 @@ criterion_group!(
     rt_curr_scheduler,
     rt_curr_spawn_many_local,
     rt_curr_spawn_many_remote_idle,
-    rt_curr_spawn_many_remote_busy
+    rt_curr_spawn_many_remote_busy,
+    rt_curr_yield_many_single_task
 );
 
 criterion_main!(rt_curr_scheduler);
