@@ -3,9 +3,75 @@
 //! See [`Handle::dump`][crate::runtime::Handle::dump].
 
 use crate::task::Id;
+use std::cell::RefCell;
 use std::{fmt, future::Future, path::Path};
 
 pub use crate::runtime::task::trace::Root;
+
+// ---------------------------------------------------------------------------
+// Per-poll task dump capture via thread-local
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static TASK_DUMP_REQUESTED: RefCell<bool> = const { RefCell::new(false) };
+    static TASK_DUMP_STORAGE: RefCell<Option<Trace>> = const { RefCell::new(None) };
+}
+
+/// Signal that a task dump should be captured on the next poll.
+///
+/// Call this inside an [`on_before_task_poll`] hook. The runtime will then
+/// invoke [`Trace::capture`] around the task's `Future::poll`, storing
+/// the result in a thread-local. Retrieve it afterwards with
+/// [`get_task_dump`].
+///
+/// [`on_before_task_poll`]: crate::runtime::Builder::on_before_task_poll
+///
+/// # Example
+///
+/// ```no_run
+/// use tokio::runtime::dump::{request_task_dump, get_task_dump};
+///
+/// let rt = tokio::runtime::Builder::new_multi_thread()
+///     .enable_all()
+///     .on_before_task_poll(|_meta| {
+///         request_task_dump();
+///     })
+///     .on_after_task_poll(|_meta| {
+///         if let Some(trace) = get_task_dump() {
+///             println!("{trace}");
+///         }
+///     })
+///     .build()
+///     .unwrap();
+/// ```
+pub fn request_task_dump() {
+    TASK_DUMP_REQUESTED.with(|r| {
+        *r.borrow_mut() = true;
+    });
+}
+
+/// Retrieve the [`Trace`] captured during the most recent poll, if any.
+///
+/// Returns `None` if [`request_task_dump`] was not called before this poll,
+/// or if capture failed. Calling this clears the stored trace.
+///
+/// See [`request_task_dump`] for a usage example.
+pub fn get_task_dump() -> Option<Trace> {
+    TASK_DUMP_STORAGE.with(|s| s.borrow_mut().take())
+}
+
+/// Consume and return the pending request flag, resetting it to `false`.
+pub(crate) fn take_task_dump_request() -> bool {
+    TASK_DUMP_REQUESTED.with(|r| r.replace(false))
+}
+
+/// Store a captured trace in the thread-local for later retrieval via
+/// [`get_task_dump`].
+pub(crate) fn store_task_dump_trace(inner: super::task::trace::Trace) {
+    TASK_DUMP_STORAGE.with(|s| {
+        *s.borrow_mut() = Some(Trace { inner });
+    });
+}
 
 /// A snapshot of a runtime's state.
 ///

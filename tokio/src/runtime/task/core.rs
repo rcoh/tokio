@@ -360,6 +360,10 @@ impl<T: Future, S: Schedule> Core<T, S> {
     /// `self` must also be pinned. This is handled by storing the task on the
     /// heap.
     pub(super) fn poll(&self, mut cx: Context<'_>) -> Poll<T::Output> {
+        if let Some(res) = self.maybe_capture_and_poll(&mut cx) {
+            return res;
+        }
+
         let res = {
             self.stage.stage.with_mut(|ptr| {
                 // Safety: The caller ensures mutual exclusion to the field.
@@ -427,6 +431,63 @@ impl<T: Future, S: Schedule> Core<T, S> {
     unsafe fn set_stage(&self, stage: Stage<T>) {
         let _guard = TaskIdGuard::enter(self.task_id);
         self.stage.stage.with_mut(|ptr| *ptr = stage);
+    }
+}
+
+cfg_taskdump! {
+    impl<T: Future, S: Schedule> Core<T, S> {
+        /// If a per-poll task dump was requested, capture a trace by polling
+        /// the future inside `Trace::capture`, store the trace, then return
+        /// `None` so that `poll()` continues with a normal poll for forward
+        /// progress.
+        ///
+        /// If the future happens to complete during the capture poll, return
+        /// `Some(res)` so the caller can skip the second poll.
+        ///
+        /// Returns `None` when no dump was requested.
+        fn maybe_capture_and_poll(&self, cx: &mut Context<'_>) -> Option<Poll<T::Output>> {
+            if !crate::runtime::dump::take_task_dump_request() {
+                return None;
+            }
+
+            let capture_res = {
+                self.stage.stage.with_mut(|ptr| {
+                    // Safety: The caller ensures mutual exclusion to the field.
+                    let future = match unsafe { &mut *ptr } {
+                        Stage::Running(future) => future,
+                        _ => unreachable!("unexpected stage"),
+                    };
+
+                    // Safety: The caller ensures the future is pinned.
+                    let future = unsafe { Pin::new_unchecked(future) };
+
+                    let _guard = TaskIdGuard::enter(self.task_id);
+                    let (res, trace) =
+                        crate::runtime::task::trace::Trace::capture(|| future.poll(cx));
+                    crate::runtime::dump::store_task_dump_trace(trace);
+                    res
+                })
+            };
+
+            if capture_res.is_ready() {
+                // The future completed during the capture poll (it didn't hit
+                // any Tokio leaf futures that would short-circuit). No second
+                // poll is needed.
+                self.drop_future_or_output();
+                Some(capture_res)
+            } else {
+                // Fall through to normal poll for forward progress.
+                None
+            }
+        }
+    }
+}
+
+cfg_not_taskdump! {
+    impl<T: Future, S: Schedule> Core<T, S> {
+        fn maybe_capture_and_poll(&self, _cx: &mut Context<'_>) -> Option<Poll<T::Output>> {
+            None
+        }
     }
 }
 

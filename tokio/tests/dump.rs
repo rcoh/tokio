@@ -100,6 +100,185 @@ fn multi_thread() {
     });
 }
 
+/// Tests for per-poll task dump capture via `request_task_dump` / `get_task_dump`.
+mod per_poll_task_dump {
+    use std::hint::black_box;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::runtime::{self, dump};
+
+    #[inline(never)]
+    async fn traced_leaf() {
+        loop {
+            black_box(tokio::task::yield_now()).await;
+        }
+    }
+
+    #[test]
+    fn current_thread_capture() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let traces2 = traces.clone();
+
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_before_task_poll(|_meta| {
+                dump::request_task_dump();
+            })
+            .on_after_task_poll(move |_meta| {
+                if let Some(trace) = dump::get_task_dump() {
+                    traces2.lock().unwrap().push(trace.to_string());
+                }
+            })
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let handle = tokio::spawn(traced_leaf());
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            handle.abort();
+            let _ = handle.await;
+        });
+
+        let traces = traces.lock().unwrap();
+        // Filter out the empty trace from the abort/cancellation poll.
+        let valid: Vec<_> = traces.iter().filter(|t| !t.is_empty()).collect();
+        assert!(!valid.is_empty(), "expected at least one non-empty trace");
+        for trace in &valid {
+            assert!(
+                trace.contains("per_poll_task_dump::traced_leaf"),
+                "trace should contain traced_leaf, got:\n{trace}"
+            );
+            assert!(
+                trace.contains("tokio::task::yield_now"),
+                "trace should contain yield_now, got:\n{trace}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_thread_capture() {
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let traces2 = traces.clone();
+
+        let rt = runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .on_before_task_poll(|_meta| {
+                dump::request_task_dump();
+            })
+            .on_after_task_poll(move |_meta| {
+                if let Some(trace) = dump::get_task_dump() {
+                    traces2.lock().unwrap().push(trace.to_string());
+                }
+            })
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let handle = tokio::spawn(traced_leaf());
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            handle.abort();
+            let _ = handle.await;
+        });
+
+        let traces = traces.lock().unwrap();
+        let valid: Vec<_> = traces.iter().filter(|t| !t.is_empty()).collect();
+        assert!(!valid.is_empty(), "expected at least one non-empty trace");
+        for trace in &valid {
+            assert!(
+                trace.contains("per_poll_task_dump::traced_leaf"),
+                "trace should contain traced_leaf, got:\n{trace}"
+            );
+            assert!(
+                trace.contains("tokio::task::yield_now"),
+                "trace should contain yield_now, got:\n{trace}"
+            );
+        }
+    }
+
+    /// When `request_task_dump` is NOT called, `get_task_dump` should return `None`.
+    #[test]
+    fn no_request_means_no_capture() {
+        let unexpected = Arc::new(AtomicUsize::new(0));
+        let unexpected2 = unexpected.clone();
+
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            // do NOT call request_task_dump in before-poll
+            .on_after_task_poll(move |_meta| {
+                if dump::get_task_dump().is_some() {
+                    unexpected2.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let handle = tokio::spawn(traced_leaf());
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            handle.abort();
+            let _ = handle.await;
+        });
+
+        assert_eq!(unexpected.load(Ordering::Relaxed), 0);
+    }
+
+    /// Verify that tasks make forward progress even when every poll is traced.
+    /// The harness polls twice per task run: once with capture, once normally.
+    #[test]
+    fn forward_progress_with_capture() {
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_before_task_poll(|_meta| {
+                dump::request_task_dump();
+            })
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            // This task must complete despite every poll being traced.
+            let result = tokio::spawn(async {
+                tokio::task::yield_now().await;
+                42
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(result, 42);
+        });
+    }
+
+    /// Same as above but on the multi-thread runtime.
+    #[test]
+    fn forward_progress_with_capture_multi_thread() {
+        let rt = runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .on_before_task_poll(|_meta| {
+                dump::request_task_dump();
+            })
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let result = tokio::spawn(async {
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                42
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(result, 42);
+        });
+    }
+}
+
 /// Regression tests for #6035.
 ///
 /// These tests ensure that dumping will not deadlock if a future completes
