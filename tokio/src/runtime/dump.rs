@@ -60,18 +60,23 @@ pub fn get_task_dump() -> Option<Trace> {
     TASK_DUMP_STORAGE.with(|s| s.borrow_mut().take())
 }
 
-/// Clear the request flag and, if it was set, capture a trace by running
-/// `poll_fn` inside [`Trace::capture`], storing the result in the
-/// thread-local.
+/// Consume and return the pending request flag, resetting it to `false`.
+fn take_task_dump_request() -> bool {
+    TASK_DUMP_REQUESTED.with(|r| r.replace(false))
+}
+
+/// If a task dump was requested via [`request_task_dump`], capture a trace
+/// by running `poll_fn` inside [`Trace::capture`] and store the result in
+/// a thread-local for later retrieval with [`get_task_dump`].
+///
+/// If no dump was requested, `poll_fn` is called directly.
 ///
 /// Returns the result from the inner poll.
 pub(crate) fn maybe_capture_task_dump<F, R>(poll_fn: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let requested = TASK_DUMP_REQUESTED.with(|r| r.replace(false));
-
-    if requested {
+    if take_task_dump_request() {
         let (result, trace_inner) = super::task::trace::Trace::capture(poll_fn);
         let trace = Trace { inner: trace_inner };
         TASK_DUMP_STORAGE.with(|s| {

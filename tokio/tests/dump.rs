@@ -104,7 +104,7 @@ fn multi_thread() {
 mod per_poll_task_dump {
     use std::hint::black_box;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::runtime::{self, dump};
 
     #[inline(never)]
@@ -116,8 +116,8 @@ mod per_poll_task_dump {
 
     #[test]
     fn current_thread_capture() {
-        let traces_captured = Arc::new(AtomicUsize::new(0));
-        let traces_captured2 = traces_captured.clone();
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let traces2 = traces.clone();
 
         let rt = runtime::Builder::new_current_thread()
             .enable_all()
@@ -125,8 +125,8 @@ mod per_poll_task_dump {
                 dump::request_task_dump();
             })
             .on_after_task_poll(move |_meta| {
-                if dump::get_task_dump().is_some() {
-                    traces_captured2.fetch_add(1, Ordering::Relaxed);
+                if let Some(trace) = dump::get_task_dump() {
+                    traces2.lock().unwrap().push(trace.to_string());
                 }
             })
             .build()
@@ -134,7 +134,6 @@ mod per_poll_task_dump {
 
         rt.block_on(async {
             let handle = tokio::spawn(traced_leaf());
-            // Let the task poll a few times, then abort it.
             for _ in 0..5 {
                 tokio::task::yield_now().await;
             }
@@ -142,13 +141,26 @@ mod per_poll_task_dump {
             let _ = handle.await;
         });
 
-        assert!(traces_captured.load(Ordering::Relaxed) > 0);
+        let traces = traces.lock().unwrap();
+        // Filter out the empty trace from the abort/cancellation poll.
+        let valid: Vec<_> = traces.iter().filter(|t| !t.is_empty()).collect();
+        assert!(!valid.is_empty(), "expected at least one non-empty trace");
+        for trace in &valid {
+            assert!(
+                trace.contains("per_poll_task_dump::traced_leaf"),
+                "trace should contain traced_leaf, got:\n{trace}"
+            );
+            assert!(
+                trace.contains("tokio::task::yield_now"),
+                "trace should contain yield_now, got:\n{trace}"
+            );
+        }
     }
 
     #[test]
     fn multi_thread_capture() {
-        let traces_captured = Arc::new(AtomicUsize::new(0));
-        let traces_captured2 = traces_captured.clone();
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let traces2 = traces.clone();
 
         let rt = runtime::Builder::new_multi_thread()
             .enable_all()
@@ -157,8 +169,8 @@ mod per_poll_task_dump {
                 dump::request_task_dump();
             })
             .on_after_task_poll(move |_meta| {
-                if dump::get_task_dump().is_some() {
-                    traces_captured2.fetch_add(1, Ordering::Relaxed);
+                if let Some(trace) = dump::get_task_dump() {
+                    traces2.lock().unwrap().push(trace.to_string());
                 }
             })
             .build()
@@ -166,13 +178,24 @@ mod per_poll_task_dump {
 
         rt.block_on(async {
             let handle = tokio::spawn(traced_leaf());
-            // Let the task poll a few times.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             handle.abort();
             let _ = handle.await;
         });
 
-        assert!(traces_captured.load(Ordering::Relaxed) > 0);
+        let traces = traces.lock().unwrap();
+        let valid: Vec<_> = traces.iter().filter(|t| !t.is_empty()).collect();
+        assert!(!valid.is_empty(), "expected at least one non-empty trace");
+        for trace in &valid {
+            assert!(
+                trace.contains("per_poll_task_dump::traced_leaf"),
+                "trace should contain traced_leaf, got:\n{trace}"
+            );
+            assert!(
+                trace.contains("tokio::task::yield_now"),
+                "trace should contain yield_now, got:\n{trace}"
+            );
+        }
     }
 
     /// When `request_task_dump` is NOT called, `get_task_dump` should return `None`.
