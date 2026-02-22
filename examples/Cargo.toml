@@ -102,5 +102,9 @@ path = "named-pipe-multi-client.rs"
 name = "dump"
 path = "dump.rs"
 
+[[example]]
+name = "per_poll_dump"
+path = "per_poll_dump.rs"
+
 [lints]
 workspace = true

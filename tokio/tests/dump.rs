@@ -100,6 +100,111 @@ fn multi_thread() {
     });
 }
 
+/// Tests for per-poll task dump capture via `request_task_dump` / `get_task_dump`.
+mod per_poll_task_dump {
+    use std::hint::black_box;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::runtime::{self, dump};
+
+    #[inline(never)]
+    async fn traced_leaf() {
+        loop {
+            black_box(tokio::task::yield_now()).await;
+        }
+    }
+
+    #[test]
+    fn current_thread_capture() {
+        let traces_captured = Arc::new(AtomicUsize::new(0));
+        let traces_captured2 = traces_captured.clone();
+
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_before_task_poll(|_meta| {
+                dump::request_task_dump();
+            })
+            .on_after_task_poll(move |_meta| {
+                if dump::get_task_dump().is_some() {
+                    traces_captured2.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let handle = tokio::spawn(traced_leaf());
+            // Let the task poll a few times, then abort it.
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            handle.abort();
+            let _ = handle.await;
+        });
+
+        assert!(traces_captured.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn multi_thread_capture() {
+        let traces_captured = Arc::new(AtomicUsize::new(0));
+        let traces_captured2 = traces_captured.clone();
+
+        let rt = runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .on_before_task_poll(|_meta| {
+                dump::request_task_dump();
+            })
+            .on_after_task_poll(move |_meta| {
+                if dump::get_task_dump().is_some() {
+                    traces_captured2.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let handle = tokio::spawn(traced_leaf());
+            // Let the task poll a few times.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            handle.abort();
+            let _ = handle.await;
+        });
+
+        assert!(traces_captured.load(Ordering::Relaxed) > 0);
+    }
+
+    /// When `request_task_dump` is NOT called, `get_task_dump` should return `None`.
+    #[test]
+    fn no_request_means_no_capture() {
+        let unexpected = Arc::new(AtomicUsize::new(0));
+        let unexpected2 = unexpected.clone();
+
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            // do NOT call request_task_dump in before-poll
+            .on_after_task_poll(move |_meta| {
+                if dump::get_task_dump().is_some() {
+                    unexpected2.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let handle = tokio::spawn(traced_leaf());
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            handle.abort();
+            let _ = handle.await;
+        });
+
+        assert_eq!(unexpected.load(Ordering::Relaxed), 0);
+    }
+}
+
 /// Regression tests for #6035.
 ///
 /// These tests ensure that dumping will not deadlock if a future completes

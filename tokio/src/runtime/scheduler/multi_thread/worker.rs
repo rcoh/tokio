@@ -80,10 +80,18 @@ mod metrics;
 
 cfg_taskdump! {
     mod taskdump;
+
+    fn run_task_with_dump(task: crate::runtime::task::LocalNotified<Arc<Handle>>) {
+        crate::runtime::dump::maybe_capture_task_dump(|| task.run());
+    }
 }
 
 cfg_not_taskdump! {
     mod taskdump_mock;
+
+    fn run_task_with_dump(task: crate::runtime::task::LocalNotified<Arc<Handle>>) {
+        task.run();
+    }
 }
 
 #[cfg(all(tokio_unstable, feature = "time"))]
@@ -644,7 +652,7 @@ impl Context {
                 .task_hooks
                 .poll_start_callback(&task_meta);
 
-            task.run();
+            run_task_with_dump(task);
 
             #[cfg(tokio_unstable)]
             self.worker.handle.task_hooks.poll_stop_callback(&task_meta);
@@ -721,7 +729,7 @@ impl Context {
                     .task_hooks
                     .poll_start_callback(&task_meta);
 
-                task.run();
+                run_task_with_dump(task);
 
                 #[cfg(tokio_unstable)]
                 self.worker.handle.task_hooks.poll_stop_callback(&task_meta);
