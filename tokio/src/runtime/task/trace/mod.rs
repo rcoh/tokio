@@ -184,22 +184,14 @@ pub(crate) fn trace_leaf(cx: &mut task::Context<'_>) -> Poll<()> {
                     // We collect raw return addresses here and defer
                     // symbolization to display time (in tree.rs), matching the
                     // "new_unresolved" pattern but without any lock acquisition.
-                    //
-                    // The sentinel comparisons use the return address directly.
-                    // Because a return address points *inside* the caller (just
-                    // past the call instruction), we check whether each address
-                    // falls within the function's body rather than comparing
-                    // against its exact start address.
-                    #[cfg(target_arch = "x86_64")]
+                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                     {
                         let mut fp: *const usize;
+                        #[cfg(target_arch = "x86_64")]
                         std::arch::asm!("mov {}, rbp", out(reg) fp);
+                        #[cfg(target_arch = "aarch64")]
+                        std::arch::asm!("mov {}, x29", out(reg) fp);
 
-                        // Resolve sentinel bounds.  trace_leaf_bounds() is
-                        // cached after the first call; resolve_root_bounds()
-                        // calls backtrace::resolve once per dump (acceptable:
-                        // dumps are rare and the lock is not held during the
-                        // walk itself).
                         let leaf_bounds = trace_leaf_bounds();
                         let root_bounds = resolve_root_bounds(active_frame.inner_addr);
 
@@ -233,10 +225,8 @@ pub(crate) fn trace_leaf(cx: &mut task::Context<'_>) -> Poll<()> {
                         }
                     }
 
-                    // On non-x86_64 targets fall back to the backtrace crate.
-                    // (frame-pointer unwinding on other arches can be added
-                    // incrementally.)
-                    #[cfg(not(target_arch = "x86_64"))]
+                    // On other targets fall back to the backtrace crate.
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                     {
                         let mut above_leaf = false;
                         backtrace::trace(|frame| {
@@ -322,7 +312,7 @@ impl FunctionBounds {
 ///
 /// The `trace_leaf` function is concrete (not generic), so its bounds are
 /// stable for the lifetime of the process.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn trace_leaf_bounds() -> FunctionBounds {
     use std::sync::OnceLock;
     static BOUNDS: OnceLock<FunctionBounds> = OnceLock::new();
@@ -337,7 +327,7 @@ fn trace_leaf_bounds() -> FunctionBounds {
 /// is no convenient place to store per-type statics.  The lock is only held
 /// during the *first* dump that encounters a given `T`; afterwards the OS
 /// symbol-resolution cache makes repeated calls cheap.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn resolve_root_bounds(inner_addr: *const c_void) -> FunctionBounds {
     FunctionBounds::resolve(inner_addr)
 }
