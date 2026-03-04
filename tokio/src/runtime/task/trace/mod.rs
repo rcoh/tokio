@@ -23,7 +23,7 @@ use super::{Notified, OwnedTasks, Schedule};
 
 /// A raw backtrace captured via frame pointer unwinding.
 /// Each element is a return address collected while walking the call stack.
-type Backtrace = Vec<*mut c_void>;
+type Backtrace = Vec<FrameAddr>;
 type SymbolTrace = Vec<Symbol>;
 
 /// The ambient backtracing context.
@@ -48,6 +48,27 @@ struct Frame {
 ///
 /// Traces are captured with [`Trace::capture`], rooted with [`Trace::root`]
 /// and leaved with [`trace_leaf`].
+/// A raw instruction pointer captured during stack unwinding.
+///
+/// This is a code address (not a pointer to data) suitable for passing to
+/// `backtrace::resolve` or offline symbolization tools like `addr2line`.
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
+pub struct FrameAddr(*mut c_void);
+
+// SAFETY: The wrapped pointer is a code address (instruction pointer),
+// not a pointer to owned heap data. Safe to send/share across threads.
+unsafe impl Send for FrameAddr {}
+unsafe impl Sync for FrameAddr {}
+
+impl FrameAddr {
+    /// Returns the raw instruction pointer.
+    #[inline]
+    pub fn addr(self) -> *mut c_void {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TraceMode {
     /// Use `backtrace::trace` (always works, takes global lock).
@@ -67,12 +88,6 @@ pub(crate) struct Trace {
     backtraces: Vec<Backtrace>,
     mode: TraceMode,
 }
-
-// SAFETY: `Backtrace` is `Vec<*mut c_void>` where the pointers are code
-// addresses (instruction pointers), not pointers to owned heap data.
-// It is safe to send these across threads.
-unsafe impl Send for Trace {}
-unsafe impl Sync for Trace {}
 
 pin_project_lite::pin_project! {
     #[derive(Debug, Clone)]
@@ -283,7 +298,7 @@ fn trace_leaf_fp(frames: &mut Backtrace, active_frame: &Frame) {
             let below_root = !root_bounds.contains(ret_addr);
 
             if above_leaf && below_root {
-                frames.push(ret_addr);
+                frames.push(FrameAddr(ret_addr));
             }
 
             if !above_leaf && leaf_bounds.contains(ret_addr) {
@@ -315,7 +330,7 @@ fn trace_leaf_backtrace(frames: &mut Backtrace, active_frame: &Frame) {
     backtrace::trace(|frame| {
         let below_root = !ptr::eq(frame.symbol_address(), active_frame.inner_addr);
         if above_leaf && below_root {
-            frames.push(frame.ip());
+            frames.push(FrameAddr(frame.ip()));
         }
         if ptr::eq(frame.symbol_address(), trace_leaf as *const _) {
             above_leaf = true;

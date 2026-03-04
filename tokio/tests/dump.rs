@@ -77,7 +77,7 @@ fn raw_backtraces_resolve() {
             let mut names = Vec::new();
             for raw_bt in task.trace().raw_backtraces() {
                 for &addr in raw_bt {
-                    backtrace::resolve(addr, |sym| {
+                    backtrace::resolve(addr.addr(), |sym| {
                         if let Some(name) = sym.name() {
                             names.push(format!("{name}"));
                         }

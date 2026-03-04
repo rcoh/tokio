@@ -3,9 +3,9 @@
 //! See [`Handle::dump`][crate::runtime::Handle::dump].
 
 use crate::task::Id;
-use std::{ffi::c_void, fmt, future::Future, path::Path};
+use std::{fmt, future::Future, path::Path};
 
-pub use crate::runtime::task::trace::Root;
+pub use crate::runtime::task::trace::{FrameAddr, Root};
 
 /// A snapshot of a runtime's state.
 ///
@@ -175,7 +175,7 @@ impl Trace {
     /// or `blazesym`) after adjusting for the process's load address.
     ///
     /// This method never acquires any lock and performs no I/O.
-    pub fn raw_backtraces(&self) -> impl Iterator<Item = &[*mut c_void]> {
+    pub fn raw_backtraces(&self) -> impl Iterator<Item = &[FrameAddr]> {
         self.inner.backtraces().iter().map(|bt| bt.as_slice())
     }
 
@@ -196,7 +196,7 @@ impl Trace {
                 let mut frames: Vec<BacktraceFrame> = Vec::new();
                 for &addr in raw_bt {
                     let mut symbols: Vec<BacktraceSymbol> = Vec::new();
-                    backtrace::resolve(addr as *mut _, |sym| {
+                    backtrace::resolve(addr.addr(), |sym| {
                         symbols.push(BacktraceSymbol {
                             name: sym.name().map(|n| n.as_bytes().into()),
                             name_demangled: sym.name().map(|n| format!("{n}").into()),
@@ -207,9 +207,9 @@ impl Trace {
                         });
                     });
                     frames.push(BacktraceFrame {
-                        ip: Address(addr as *mut _),
+                        ip: Address(addr.addr()),
                         symbol_address: Address(
-                            symbols.first().and_then(|s| s.addr).map_or(addr, |a| a.0)
+                            symbols.first().and_then(|s| s.addr).map_or(addr.addr(), |a| a.0)
                         ),
                         symbols: symbols.into_boxed_slice(),
                     });

@@ -100,7 +100,7 @@ fn to_symboltrace(backtrace: Backtrace) -> SymbolTrace {
 
         // backtrace::resolve takes the global lock internally; that is
         // acceptable at display time.
-        backtrace::resolve(addr as *mut _, |sym| {
+        backtrace::resolve(addr.addr(), |sym| {
             symboltrace.push(Symbol::from_callback(sym, parent_hash));
         });
 
