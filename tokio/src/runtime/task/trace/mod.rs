@@ -277,6 +277,24 @@ impl fmt::Display for Trace {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(never)]
 fn trace_leaf_fp(frames: &mut Backtrace, active_frame: &Frame) {
+    // When walking frame pointers, we have return addresses (pointing into
+    // the *caller*), not symbol addresses. We need to identify two sentinel
+    // frames:
+    //
+    //   1. `trace_leaf` — start collecting frames *above* it
+    //   2. `Root::poll` — stop collecting when we reach it
+    //
+    // The old backtrace::trace code used `frame.symbol_address()` which
+    // resolves a return address to its containing function's entry point,
+    // allowing exact `ptr::eq` comparison. We don't have that luxury here.
+    //
+    // Instead, we compare return addresses against the known function entry
+    // points. A return address inside function F satisfies:
+    //   F <= ret_addr < F + sizeof(F)
+    // We don't know sizeof(F), but these are small `#[inline(never)]`
+    // functions, so we use a conservative 64 KiB upper bound.
+    const MAX_FN_SIZE: usize = 0x10000;
+
     unsafe {
         let mut fp: *const usize;
         #[cfg(target_arch = "x86_64")]
@@ -284,28 +302,28 @@ fn trace_leaf_fp(frames: &mut Backtrace, active_frame: &Frame) {
         #[cfg(target_arch = "aarch64")]
         std::arch::asm!("mov {}, x29", out(reg) fp);
 
-        let leaf_bounds = trace_leaf_bounds();
-        let root_bounds = resolve_root_bounds(active_frame.inner_addr);
+        let leaf_start = trace_leaf as usize;
+        let root_start = active_frame.inner_addr as usize;
 
         let mut above_leaf = false;
 
         while !fp.is_null() && fp.is_aligned() {
-            let ret_addr = *fp.add(1) as *mut c_void;
-            if ret_addr.is_null() {
+            let ret_addr = *fp.add(1) as usize;
+            if ret_addr == 0 {
                 break;
             }
 
-            let below_root = !root_bounds.contains(ret_addr);
+            let in_root = ret_addr >= root_start && ret_addr < root_start + MAX_FN_SIZE;
 
-            if above_leaf && below_root {
-                frames.push(FrameAddr(ret_addr));
+            if above_leaf && !in_root {
+                frames.push(FrameAddr(ret_addr as *mut c_void));
             }
 
-            if !above_leaf && leaf_bounds.contains(ret_addr) {
+            if !above_leaf && ret_addr >= leaf_start && ret_addr < leaf_start + MAX_FN_SIZE {
                 above_leaf = true;
             }
 
-            if !below_root {
+            if in_root {
                 break;
             }
 
@@ -337,60 +355,6 @@ fn trace_leaf_backtrace(frames: &mut Backtrace, active_frame: &Frame) {
         }
         below_root
     });
-}
-
-/// The start and (exclusive) end address of a function's machine code, as
-/// resolved once at startup from debug info via `backtrace::resolve`.
-#[derive(Copy, Clone)]
-struct FunctionBounds {
-    start: usize,
-    end: usize,
-}
-
-impl FunctionBounds {
-    /// Resolve the bounds of the function whose entry point is `fn_ptr`.
-    ///
-    /// This calls `backtrace::resolve` exactly once (at startup) and pays the
-    /// lock cost there rather than on every frame-pointer walk.  If resolution
-    /// fails (no debug info, stripped binary) we fall back to a 64 KiB window —
-    /// still far better than the old always-heuristic approach.
-    fn resolve(fn_ptr: *const c_void) -> Self {
-        let start = fn_ptr as usize;
-        // backtrace::Symbol does not expose function size, so we use a
-        // 64 KiB window as a conservative upper bound.
-        let end = start + 0x10000;
-        FunctionBounds { start, end }
-    }
-
-    #[inline]
-    fn contains(self, addr: *mut c_void) -> bool {
-        let addr = addr as usize;
-        addr >= self.start && addr < self.end
-    }
-}
-
-/// Cached bounds of `trace_leaf`, resolved once on first use.
-///
-/// The `trace_leaf` function is concrete (not generic), so its bounds are
-/// stable for the lifetime of the process.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn trace_leaf_bounds() -> FunctionBounds {
-    use std::sync::OnceLock;
-    static BOUNDS: OnceLock<FunctionBounds> = OnceLock::new();
-    *BOUNDS.get_or_init(|| FunctionBounds::resolve(trace_leaf as *const c_void))
-}
-
-/// Resolve the bounds of a monomorphized `Root::<T>::poll` on first use for
-/// this particular instantiation.
-///
-/// Unlike `trace_leaf`, `Root::poll` is generic, so each `T` produces a
-/// distinct function.  We resolve per-call rather than per-type because there
-/// is no convenient place to store per-type statics.  The lock is only held
-/// during the *first* dump that encounters a given `T`; afterwards the OS
-/// symbol-resolution cache makes repeated calls cheap.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn resolve_root_bounds(inner_addr: *const c_void) -> FunctionBounds {
-    FunctionBounds::resolve(inner_addr)
 }
 
 fn defer<F: FnOnce() -> R, R>(f: F) -> impl Drop {
