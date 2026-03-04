@@ -21,8 +21,7 @@ use tree::Tree;
 
 use super::{Notified, OwnedTasks, Schedule};
 
-/// A raw backtrace captured via frame pointer unwinding.
-/// Each element is a return address collected while walking the call stack.
+/// A raw backtrace captured during stack unwinding.
 type Backtrace = Vec<FrameAddr>;
 type SymbolTrace = Vec<Symbol>;
 
@@ -87,6 +86,9 @@ pub(crate) struct Trace {
     // be re-knitted into a tree.
     backtraces: Vec<Backtrace>,
     mode: TraceMode,
+    /// For FramePointer mode: the Root::poll address for each backtrace,
+    /// used to filter frames at symbolization time.
+    root_addrs: Vec<usize>,
 }
 
 pin_project_lite::pin_project! {
@@ -185,6 +187,7 @@ impl Trace {
         let collector = Trace {
             backtraces: vec![],
             mode,
+            root_addrs: vec![],
         };
 
         let previous = Context::with_current_collector(|current| current.replace(Some(collector)));
@@ -231,9 +234,11 @@ pub(crate) fn trace_leaf(cx: &mut task::Context<'_>) -> Poll<()> {
                     match collector.mode {
                         TraceMode::FramePointer => {
                             trace_leaf_fp(&mut frames, active_frame);
+                            collector.root_addrs.push(active_frame.inner_addr as usize);
                         }
                         TraceMode::Backtrace => {
                             trace_leaf_backtrace(&mut frames, active_frame);
+                            collector.root_addrs.push(0); // not used
                         }
                     }
                 }
@@ -274,27 +279,14 @@ impl fmt::Display for Trace {
 }
 
 /// Walk the stack using frame pointers. Only available on x86_64 and aarch64.
+///
+/// Collects the entire frame pointer chain as raw return addresses. Filtering
+/// (removing frames below `trace_leaf` and above `Root::poll`) is deferred to
+/// symbolization time in `to_symboltrace`, where `backtrace::resolve` can
+/// identify functions exactly.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(never)]
-fn trace_leaf_fp(frames: &mut Backtrace, active_frame: &Frame) {
-    // When walking frame pointers, we have return addresses (pointing into
-    // the *caller*), not symbol addresses. We need to identify two sentinel
-    // frames:
-    //
-    //   1. `trace_leaf` — start collecting frames *above* it
-    //   2. `Root::poll` — stop collecting when we reach it
-    //
-    // The old backtrace::trace code used `frame.symbol_address()` which
-    // resolves a return address to its containing function's entry point,
-    // allowing exact `ptr::eq` comparison. We don't have that luxury here.
-    //
-    // Instead, we compare return addresses against the known function entry
-    // points. A return address inside function F satisfies:
-    //   F <= ret_addr < F + sizeof(F)
-    // We don't know sizeof(F), but these are small `#[inline(never)]`
-    // functions, so we use a conservative 64 KiB upper bound.
-    const MAX_FN_SIZE: usize = 0x10000;
-
+fn trace_leaf_fp(frames: &mut Backtrace, _active_frame: &Frame) {
     unsafe {
         let mut fp: *const usize;
         #[cfg(target_arch = "x86_64")]
@@ -302,30 +294,13 @@ fn trace_leaf_fp(frames: &mut Backtrace, active_frame: &Frame) {
         #[cfg(target_arch = "aarch64")]
         std::arch::asm!("mov {}, x29", out(reg) fp);
 
-        let leaf_start = trace_leaf as usize;
-        let root_start = active_frame.inner_addr as usize;
-
-        let mut above_leaf = false;
-
         while !fp.is_null() && fp.is_aligned() {
-            let ret_addr = *fp.add(1) as usize;
-            if ret_addr == 0 {
+            let ret_addr = *fp.add(1) as *mut c_void;
+            if ret_addr.is_null() {
                 break;
             }
 
-            let in_root = ret_addr >= root_start && ret_addr < root_start + MAX_FN_SIZE;
-
-            if above_leaf && !in_root {
-                frames.push(FrameAddr(ret_addr as *mut c_void));
-            }
-
-            if !above_leaf && ret_addr >= leaf_start && ret_addr < leaf_start + MAX_FN_SIZE {
-                above_leaf = true;
-            }
-
-            if in_root {
-                break;
-            }
+            frames.push(FrameAddr(ret_addr));
 
             let next = *fp as *const usize;
             if next <= fp {

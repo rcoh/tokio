@@ -2,7 +2,7 @@ use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use super::{Backtrace, Symbol, SymbolTrace, Trace};
+use super::{Backtrace, Symbol, SymbolTrace, Trace, TraceMode};
 
 /// An adjacency list representation of an execution tree.
 pub(super) struct Tree {
@@ -15,8 +15,10 @@ impl Tree {
         let mut roots: HashSet<Symbol> = HashSet::default();
         let mut edges: HashMap<Symbol, HashSet<Symbol>> = HashMap::default();
 
-        for backtrace in trace.backtraces {
-            let symboltrace = to_symboltrace(backtrace);
+        let mode = trace.mode;
+        for (i, backtrace) in trace.backtraces.into_iter().enumerate() {
+            let root_addr = trace.root_addrs.get(i).copied().unwrap_or(0);
+            let symboltrace = to_symboltrace(backtrace, mode, root_addr);
 
             if let Some(first) = symboltrace.first() {
                 roots.insert(first.clone());
@@ -88,21 +90,44 @@ impl fmt::Display for Tree {
 
 /// Convert a raw [`Backtrace`] (instruction pointers) into a [`SymbolTrace`].
 ///
-/// Symbolization is deferred to here (display time) so the capture path in
-/// `trace_leaf` never acquires the backtrace-rs global lock.
-fn to_symboltrace(backtrace: Backtrace) -> SymbolTrace {
+/// In `FramePointer` mode the backtrace contains the entire fp chain, so we
+/// filter here: skip frames until we see `trace_leaf`, stop at `Root::poll`.
+/// In `Backtrace` mode the frames are already filtered during capture.
+fn to_symboltrace(backtrace: Backtrace, mode: TraceMode, root_addr: usize) -> SymbolTrace {
     let mut symboltrace: SymbolTrace = vec![];
     let mut state = DefaultHasher::new();
 
+    let mut above_leaf = mode == TraceMode::Backtrace; // already filtered
+    let trace_leaf_addr = super::trace_leaf as usize;
+
     for addr in backtrace {
+        let mut sym_addr: Option<usize> = None;
         let parent_hash = state.finish();
         let before = symboltrace.len();
 
-        // backtrace::resolve takes the global lock internally; that is
-        // acceptable at display time.
         backtrace::resolve(addr.addr(), |sym| {
-            symboltrace.push(Symbol::from_callback(sym, parent_hash));
+            if sym_addr.is_none() {
+                sym_addr = sym.addr().map(|a| a as usize);
+            }
+            if above_leaf {
+                symboltrace.push(Symbol::from_callback(sym, parent_hash));
+            }
         });
+
+        if mode == TraceMode::FramePointer {
+            if let Some(resolved) = sym_addr {
+                if !above_leaf {
+                    if resolved == trace_leaf_addr {
+                        above_leaf = true;
+                    }
+                    continue;
+                }
+                if resolved == root_addr {
+                    symboltrace.truncate(before);
+                    break;
+                }
+            }
+        }
 
         for sym in &symboltrace[before..] {
             sym.hash(&mut state);
