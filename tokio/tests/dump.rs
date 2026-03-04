@@ -63,6 +63,46 @@ fn current_thread() {
 }
 
 #[test]
+fn raw_backtraces_resolve() {
+    let rt = runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    async fn dump() {
+        let handle = Handle::current();
+        let dump = handle.dump().await;
+
+        for task in dump.tasks().iter() {
+            let mut names = Vec::new();
+            for raw_bt in task.trace().raw_backtraces() {
+                for &addr in raw_bt {
+                    backtrace::resolve(addr, |sym| {
+                        if let Some(name) = sym.name() {
+                            names.push(format!("{name}"));
+                        }
+                    });
+                }
+            }
+            let joined = names.join("\n");
+            assert!(joined.contains("dump::a"), "missing a in:\n{joined}");
+            assert!(joined.contains("dump::b"), "missing b in:\n{joined}");
+            assert!(joined.contains("dump::c"), "missing c in:\n{joined}");
+        }
+    }
+
+    rt.block_on(async {
+        tokio::select!(
+            biased;
+            _ = tokio::spawn(a()) => {},
+            _ = tokio::spawn(a()) => {},
+            _ = tokio::spawn(a()) => {},
+            _ = dump() => {},
+        );
+    });
+}
+
+#[test]
 fn multi_thread() {
     let rt = runtime::Builder::new_multi_thread()
         .enable_all()
