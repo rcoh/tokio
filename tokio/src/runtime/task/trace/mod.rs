@@ -48,11 +48,24 @@ struct Frame {
 ///
 /// Traces are captured with [`Trace::capture`], rooted with [`Trace::root`]
 /// and leaved with [`trace_leaf`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TraceMode {
+    /// Use `backtrace::trace` (always works, takes global lock).
+    Backtrace,
+    /// Use frame pointer unwinding (no lock, requires `-C force-frame-pointers=yes`).
+    FramePointer,
+}
+
+/// An tree execution trace.
+///
+/// Traces are captured with [`Trace::capture`], rooted with [`Trace::root`]
+/// and leaved with [`trace_leaf`].
 #[derive(Clone, Debug)]
 pub(crate) struct Trace {
     // The linear backtraces that comprise this trace. These linear traces can
     // be re-knitted into a tree.
     backtraces: Vec<Backtrace>,
+    mode: TraceMode,
 }
 
 // SAFETY: `Backtrace` is `Vec<*mut c_void>` where the pointers are code
@@ -134,7 +147,30 @@ impl Trace {
     where
         F: FnOnce() -> R,
     {
-        let collector = Trace { backtraces: vec![] };
+        Self::capture_with_mode(f, TraceMode::Backtrace)
+    }
+
+    /// Like [`capture`](Self::capture), but uses frame pointer unwinding
+    /// instead of `backtrace::trace`. This avoids the global lock in
+    /// backtrace-rs, but requires the binary to be compiled with
+    /// `-C force-frame-pointers=yes`.
+    #[inline(never)]
+    pub(crate) fn capture_fp<F, R>(f: F) -> (R, Trace)
+    where
+        F: FnOnce() -> R,
+    {
+        Self::capture_with_mode(f, TraceMode::FramePointer)
+    }
+
+    #[inline(never)]
+    fn capture_with_mode<F, R>(f: F, mode: TraceMode) -> (R, Trace)
+    where
+        F: FnOnce() -> R,
+    {
+        let collector = Trace {
+            backtraces: vec![],
+            mode,
+        };
 
         let previous = Context::with_current_collector(|current| current.replace(Some(collector)));
 
@@ -177,69 +213,13 @@ pub(crate) fn trace_leaf(cx: &mut task::Context<'_>) -> Poll<()> {
                 if let Some(active_frame) = context_cell.active_frame.get() {
                     let active_frame = active_frame.as_ref();
 
-                    // Walk the call stack using frame pointers instead of
-                    // backtrace::trace. This avoids the global lock in
-                    // backtrace-rs and is significantly faster on hot paths.
-                    //
-                    // We collect raw return addresses here and defer
-                    // symbolization to display time (in tree.rs), matching the
-                    // "new_unresolved" pattern but without any lock acquisition.
-                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-                    {
-                        let mut fp: *const usize;
-                        #[cfg(target_arch = "x86_64")]
-                        std::arch::asm!("mov {}, rbp", out(reg) fp);
-                        #[cfg(target_arch = "aarch64")]
-                        std::arch::asm!("mov {}, x29", out(reg) fp);
-
-                        let leaf_bounds = trace_leaf_bounds();
-                        let root_bounds = resolve_root_bounds(active_frame.inner_addr);
-
-                        let mut above_leaf = false;
-
-                        while !fp.is_null() && fp.is_aligned() {
-                            let ret_addr = *fp.add(1) as *mut c_void;
-                            if ret_addr.is_null() {
-                                break;
-                            }
-
-                            let below_root = !root_bounds.contains(ret_addr);
-
-                            if above_leaf && below_root {
-                                frames.push(ret_addr);
-                            }
-
-                            if !above_leaf && leaf_bounds.contains(ret_addr) {
-                                above_leaf = true;
-                            }
-
-                            if !below_root {
-                                break;
-                            }
-
-                            let next = *fp as *const usize;
-                            if next <= fp {
-                                break;
-                            }
-                            fp = next;
+                    match collector.mode {
+                        TraceMode::FramePointer => {
+                            trace_leaf_fp(&mut frames, active_frame);
                         }
-                    }
-
-                    // On other targets fall back to the backtrace crate.
-                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                    {
-                        let mut above_leaf = false;
-                        backtrace::trace(|frame| {
-                            let below_root =
-                                !ptr::eq(frame.symbol_address(), active_frame.inner_addr);
-                            if above_leaf && below_root {
-                                frames.push(frame.ip());
-                            }
-                            if ptr::eq(frame.symbol_address(), trace_leaf as *const _) {
-                                above_leaf = true;
-                            }
-                            below_root
-                        });
+                        TraceMode::Backtrace => {
+                            trace_leaf_backtrace(&mut frames, active_frame);
+                        }
                     }
                 }
 
@@ -276,6 +256,72 @@ impl fmt::Display for Trace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Tree::from_trace(self.clone()).fmt(f)
     }
+}
+
+/// Walk the stack using frame pointers. Only available on x86_64 and aarch64.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(never)]
+fn trace_leaf_fp(frames: &mut Backtrace, active_frame: &Frame) {
+    unsafe {
+        let mut fp: *const usize;
+        #[cfg(target_arch = "x86_64")]
+        std::arch::asm!("mov {}, rbp", out(reg) fp);
+        #[cfg(target_arch = "aarch64")]
+        std::arch::asm!("mov {}, x29", out(reg) fp);
+
+        let leaf_bounds = trace_leaf_bounds();
+        let root_bounds = resolve_root_bounds(active_frame.inner_addr);
+
+        let mut above_leaf = false;
+
+        while !fp.is_null() && fp.is_aligned() {
+            let ret_addr = *fp.add(1) as *mut c_void;
+            if ret_addr.is_null() {
+                break;
+            }
+
+            let below_root = !root_bounds.contains(ret_addr);
+
+            if above_leaf && below_root {
+                frames.push(ret_addr);
+            }
+
+            if !above_leaf && leaf_bounds.contains(ret_addr) {
+                above_leaf = true;
+            }
+
+            if !below_root {
+                break;
+            }
+
+            let next = *fp as *const usize;
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn trace_leaf_fp(_frames: &mut Backtrace, _active_frame: &Frame) {
+    // Frame pointer unwinding is not supported on this architecture.
+}
+
+/// Walk the stack using `backtrace::trace`. Works on all platforms.
+#[inline(never)]
+fn trace_leaf_backtrace(frames: &mut Backtrace, active_frame: &Frame) {
+    let mut above_leaf = false;
+    backtrace::trace(|frame| {
+        let below_root = !ptr::eq(frame.symbol_address(), active_frame.inner_addr);
+        if above_leaf && below_root {
+            frames.push(frame.ip());
+        }
+        if ptr::eq(frame.symbol_address(), trace_leaf as *const _) {
+            above_leaf = true;
+        }
+        below_root
+    });
 }
 
 /// The start and (exclusive) end address of a function's machine code, as
