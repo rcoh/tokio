@@ -57,18 +57,6 @@ pub struct BacktraceSymbol {
 }
 
 impl BacktraceSymbol {
-    pub(crate) fn from_backtrace_symbol(sym: &backtrace::BacktraceSymbol) -> Self {
-        let name = sym.name();
-        Self {
-            name: name.as_ref().map(|name| name.as_bytes().into()),
-            name_demangled: name.map(|name| format!("{name}").into()),
-            addr: sym.addr().map(Address),
-            filename: sym.filename().map(From::from),
-            lineno: sym.lineno(),
-            colno: sym.colno(),
-        }
-    }
-
     /// Return the raw name of the symbol.
     pub fn name_raw(&self) -> Option<&[u8]> {
         self.name.as_deref()
@@ -116,18 +104,6 @@ pub struct BacktraceFrame {
 }
 
 impl BacktraceFrame {
-    pub(crate) fn from_resolved_backtrace_frame(frame: &backtrace::BacktraceFrame) -> Self {
-        Self {
-            ip: Address(frame.ip()),
-            symbol_address: Address(frame.symbol_address()),
-            symbols: frame
-                .symbols()
-                .iter()
-                .map(BacktraceSymbol::from_backtrace_symbol)
-                .collect(),
-        }
-    }
-
     /// Return the instruction pointer of this frame.
     ///
     /// See the ABI docs for your platform for the exact meaning.
@@ -190,6 +166,23 @@ pub struct Trace {
 }
 
 impl Trace {
+    /// Returns the raw (unresolved) instruction pointers for each linear
+    /// backtrace in this trace, without performing any symbolization.
+    ///
+    /// Each inner `Vec<u64>` corresponds to one leaf future's poll backtrace,
+    /// ordered from innermost frame (closest to the leaf) outward. The
+    /// addresses are suitable for offline symbolization (e.g. with `addr2line`
+    /// or `blazesym`) after adjusting for the process's load address.
+    ///
+    /// This method never acquires any lock and performs no I/O.
+    pub fn raw_backtraces(&self) -> Vec<Vec<u64>> {
+        self.inner
+            .backtraces()
+            .iter()
+            .map(|bt| bt.iter().map(|&addr| addr as u64).collect())
+            .collect()
+    }
+
     /// Resolve and return a list of backtraces that are involved in polls in this trace.
     ///
     /// The exact backtraces included here are unstable and might change in the future,
@@ -203,16 +196,29 @@ impl Trace {
         self.inner
             .backtraces()
             .iter()
-            .map(|backtrace| {
-                let mut backtrace = backtrace::Backtrace::from(backtrace.clone());
-                backtrace.resolve();
-                Backtrace {
-                    frames: backtrace
-                        .frames()
-                        .iter()
-                        .map(BacktraceFrame::from_resolved_backtrace_frame)
-                        .collect(),
+            .map(|raw_bt| {
+                let mut frames: Vec<BacktraceFrame> = Vec::new();
+                for &addr in raw_bt {
+                    let mut symbols: Vec<BacktraceSymbol> = Vec::new();
+                    backtrace::resolve(addr as *mut _, |sym| {
+                        symbols.push(BacktraceSymbol {
+                            name: sym.name().map(|n| n.as_bytes().into()),
+                            name_demangled: sym.name().map(|n| format!("{n}").into()),
+                            addr: sym.addr().map(Address),
+                            filename: sym.filename().map(From::from),
+                            lineno: sym.lineno(),
+                            colno: sym.colno(),
+                        });
+                    });
+                    frames.push(BacktraceFrame {
+                        ip: Address(addr as *mut _),
+                        symbol_address: Address(
+                            symbols.first().and_then(|s| s.addr).map_or(addr, |a| a.0)
+                        ),
+                        symbols: symbols.into_boxed_slice(),
+                    });
                 }
+                Backtrace { frames: frames.into_boxed_slice() }
             })
             .collect()
     }

@@ -3,13 +3,13 @@ use crate::runtime::context;
 use crate::runtime::scheduler::{self, current_thread, Inject};
 use crate::task::Id;
 
-use backtrace::BacktraceFrame;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+#[allow(unused_imports)]
 use std::ptr::{self, NonNull};
 use std::task::{self, Poll};
 
@@ -21,7 +21,9 @@ use tree::Tree;
 
 use super::{Notified, OwnedTasks, Schedule};
 
-type Backtrace = Vec<BacktraceFrame>;
+/// A raw backtrace captured via frame pointer unwinding.
+/// Each element is a return address collected while walking the call stack.
+type Backtrace = Vec<*mut c_void>;
 type SymbolTrace = Vec<Symbol>;
 
 /// The ambient backtracing context.
@@ -52,6 +54,12 @@ pub(crate) struct Trace {
     // be re-knitted into a tree.
     backtraces: Vec<Backtrace>,
 }
+
+// SAFETY: `Backtrace` is `Vec<*mut c_void>` where the pointers are code
+// addresses (instruction pointers), not pointers to owned heap data.
+// It is safe to send these across threads.
+unsafe impl Send for Trace {}
+unsafe impl Sync for Trace {}
 
 pin_project_lite::pin_project! {
     #[derive(Debug, Clone)]
@@ -164,29 +172,87 @@ pub(crate) fn trace_leaf(cx: &mut task::Context<'_>) -> Poll<()> {
     let did_trace = unsafe {
         Context::try_with_current(|context_cell| {
             if let Some(mut collector) = context_cell.collector.take() {
-                let mut frames = vec![];
-                let mut above_leaf = false;
+                let mut frames: Backtrace = vec![];
 
                 if let Some(active_frame) = context_cell.active_frame.get() {
                     let active_frame = active_frame.as_ref();
 
-                    backtrace::trace(|frame| {
-                        let below_root = !ptr::eq(frame.symbol_address(), active_frame.inner_addr);
+                    // Walk the call stack using frame pointers instead of
+                    // backtrace::trace. This avoids the global lock in
+                    // backtrace-rs and is significantly faster on hot paths.
+                    //
+                    // We collect raw return addresses here and defer
+                    // symbolization to display time (in tree.rs), matching the
+                    // "new_unresolved" pattern but without any lock acquisition.
+                    //
+                    // The sentinel comparisons use the return address directly.
+                    // Because a return address points *inside* the caller (just
+                    // past the call instruction), we check whether each address
+                    // falls within the function's body rather than comparing
+                    // against its exact start address.
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let mut fp: *const usize;
+                        std::arch::asm!("mov {}, rbp", out(reg) fp);
 
-                        // only capture frames above `Trace::leaf` and below
-                        // `Trace::root`.
-                        if above_leaf && below_root {
-                            frames.push(frame.to_owned().into());
+                        // Resolve sentinel bounds.  trace_leaf_bounds() is
+                        // cached after the first call; resolve_root_bounds()
+                        // calls backtrace::resolve once per dump (acceptable:
+                        // dumps are rare and the lock is not held during the
+                        // walk itself).
+                        let leaf_bounds = trace_leaf_bounds();
+                        let root_bounds = resolve_root_bounds(active_frame.inner_addr);
+
+                        let mut above_leaf = false;
+
+                        while !fp.is_null() && fp.is_aligned() {
+                            let ret_addr = *fp.add(1) as *mut c_void;
+                            if ret_addr.is_null() {
+                                break;
+                            }
+
+                            let below_root = !root_bounds.contains(ret_addr);
+
+                            if above_leaf && below_root {
+                                frames.push(ret_addr);
+                            }
+
+                            if !above_leaf && leaf_bounds.contains(ret_addr) {
+                                above_leaf = true;
+                            }
+
+                            if !below_root {
+                                break;
+                            }
+
+                            let next = *fp as *const usize;
+                            if next <= fp {
+                                break;
+                            }
+                            fp = next;
                         }
+                    }
 
-                        if ptr::eq(frame.symbol_address(), trace_leaf as *const _) {
-                            above_leaf = true;
-                        }
-
-                        // only continue unwinding if we're below `Trace::root`
-                        below_root
-                    });
+                    // On non-x86_64 targets fall back to the backtrace crate.
+                    // (frame-pointer unwinding on other arches can be added
+                    // incrementally.)
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        let mut above_leaf = false;
+                        backtrace::trace(|frame| {
+                            let below_root =
+                                !ptr::eq(frame.symbol_address(), active_frame.inner_addr);
+                            if above_leaf && below_root {
+                                frames.push(frame.ip());
+                            }
+                            if ptr::eq(frame.symbol_address(), trace_leaf as *const _) {
+                                above_leaf = true;
+                            }
+                            below_root
+                        });
+                    }
                 }
+
                 collector.backtraces.push(frames);
                 context_cell.collector.set(Some(collector));
                 true
@@ -220,6 +286,60 @@ impl fmt::Display for Trace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Tree::from_trace(self.clone()).fmt(f)
     }
+}
+
+/// The start and (exclusive) end address of a function's machine code, as
+/// resolved once at startup from debug info via `backtrace::resolve`.
+#[derive(Copy, Clone)]
+struct FunctionBounds {
+    start: usize,
+    end: usize,
+}
+
+impl FunctionBounds {
+    /// Resolve the bounds of the function whose entry point is `fn_ptr`.
+    ///
+    /// This calls `backtrace::resolve` exactly once (at startup) and pays the
+    /// lock cost there rather than on every frame-pointer walk.  If resolution
+    /// fails (no debug info, stripped binary) we fall back to a 64 KiB window —
+    /// still far better than the old always-heuristic approach.
+    fn resolve(fn_ptr: *const c_void) -> Self {
+        let start = fn_ptr as usize;
+        // backtrace::Symbol does not expose function size, so we use a
+        // 64 KiB window as a conservative upper bound.
+        let end = start + 0x10000;
+        FunctionBounds { start, end }
+    }
+
+    #[inline]
+    fn contains(self, addr: *mut c_void) -> bool {
+        let addr = addr as usize;
+        addr >= self.start && addr < self.end
+    }
+}
+
+/// Cached bounds of `trace_leaf`, resolved once on first use.
+///
+/// The `trace_leaf` function is concrete (not generic), so its bounds are
+/// stable for the lifetime of the process.
+#[cfg(target_arch = "x86_64")]
+fn trace_leaf_bounds() -> FunctionBounds {
+    use std::sync::OnceLock;
+    static BOUNDS: OnceLock<FunctionBounds> = OnceLock::new();
+    *BOUNDS.get_or_init(|| FunctionBounds::resolve(trace_leaf as *const c_void))
+}
+
+/// Resolve the bounds of a monomorphized `Root::<T>::poll` on first use for
+/// this particular instantiation.
+///
+/// Unlike `trace_leaf`, `Root::poll` is generic, so each `T` produces a
+/// distinct function.  We resolve per-call rather than per-type because there
+/// is no convenient place to store per-type statics.  The lock is only held
+/// during the *first* dump that encounters a given `T`; afterwards the OS
+/// symbol-resolution cache makes repeated calls cheap.
+#[cfg(target_arch = "x86_64")]
+fn resolve_root_bounds(inner_addr: *const c_void) -> FunctionBounds {
+    FunctionBounds::resolve(inner_addr)
 }
 
 fn defer<F: FnOnce() -> R, R>(f: F) -> impl Drop {

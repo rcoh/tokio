@@ -1,62 +1,54 @@
-use backtrace::BacktraceSymbol;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::ptr;
+use std::path::PathBuf;
 
-/// A symbol in a backtrace.
+/// A symbolized frame captured at display time from a raw instruction pointer.
 ///
-/// This wrapper type serves two purposes. The first is that it provides a
-/// representation of a symbol that can be inserted into hashmaps and hashsets;
-/// the [`backtrace`] crate does not define [`Hash`], [`PartialEq`], or [`Eq`]
-/// on [`BacktraceSymbol`], and recommends that users define their own wrapper
-/// which implements these traits.
-///
-/// Second, this wrapper includes a `parent_hash` field that uniquely
-/// identifies this symbol's position in its trace. Otherwise, e.g., our code
-/// would not be able to distinguish between recursive calls of a function at
-/// different depths.
+/// We extract the fields we need eagerly from the `backtrace::Symbol` callback
+/// (which does not allow cloning) so that `Symbol` can be stored in hash
+/// maps and hash sets.
 #[derive(Clone)]
 pub(super) struct Symbol {
-    pub(super) symbol: BacktraceSymbol,
+    name: Option<Vec<u8>>,
+    addr: Option<usize>,
+    filename: Option<PathBuf>,
+    lineno: Option<u32>,
+    colno: Option<u32>,
     pub(super) parent_hash: u64,
 }
 
+impl Symbol {
+    pub(super) fn from_callback(sym: &backtrace::Symbol, parent_hash: u64) -> Self {
+        Symbol {
+            name: sym.name().map(|n| n.as_bytes().to_owned()),
+            addr: sym.addr().map(|a| a as usize),
+            filename: sym.filename().map(|f| f.to_owned()),
+            lineno: sym.lineno(),
+            colno: sym.colno(),
+            parent_hash,
+        }
+    }
+}
+
 impl Hash for Symbol {
-    fn hash<H>(&self, state: &mut H)
-    where
-        H: Hasher,
-    {
-        if let Some(name) = self.symbol.name() {
-            name.as_bytes().hash(state);
-        }
-
-        if let Some(addr) = self.symbol.addr() {
-            ptr::hash(addr, state);
-        }
-
-        self.symbol.filename().hash(state);
-        self.symbol.lineno().hash(state);
-        self.symbol.colno().hash(state);
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.addr.hash(state);
+        self.filename.hash(state);
+        self.lineno.hash(state);
+        self.colno.hash(state);
         self.parent_hash.hash(state);
     }
 }
 
 impl PartialEq for Symbol {
     fn eq(&self, other: &Self) -> bool {
-        (self.parent_hash == other.parent_hash)
-            && match (self.symbol.name(), other.symbol.name()) {
-                (None, None) => true,
-                (Some(lhs_name), Some(rhs_name)) => lhs_name.as_bytes() == rhs_name.as_bytes(),
-                _ => false,
-            }
-            && match (self.symbol.addr(), other.symbol.addr()) {
-                (None, None) => true,
-                (Some(lhs_addr), Some(rhs_addr)) => ptr::eq(lhs_addr, rhs_addr),
-                _ => false,
-            }
-            && (self.symbol.filename() == other.symbol.filename())
-            && (self.symbol.lineno() == other.symbol.lineno())
-            && (self.symbol.colno() == other.symbol.colno())
+        self.parent_hash == other.parent_hash
+            && self.name == other.name
+            && self.addr == other.addr
+            && self.filename == other.filename
+            && self.lineno == other.lineno
+            && self.colno == other.colno
     }
 }
 
@@ -64,25 +56,25 @@ impl Eq for Symbol {}
 
 impl fmt::Display for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(name) = self.symbol.name() {
-            let name = name.to_string();
-            let name = if let Some((name, _)) = name.rsplit_once("::") {
-                name
+        if let Some(name) = &self.name {
+            // Demangle on the fly.
+            let demangled = backtrace::SymbolName::new(name);
+            let name = demangled.to_string();
+            let name = if let Some((prefix, _)) = name.rsplit_once("::") {
+                prefix
             } else {
                 &name
             };
-            fmt::Display::fmt(&name, f)?;
+            fmt::Display::fmt(name, f)?;
         }
 
-        if let Some(filename) = self.symbol.filename() {
+        if let Some(filename) = &self.filename {
             f.write_str(" at ")?;
             filename.to_string_lossy().fmt(f)?;
-            if let Some(lineno) = self.symbol.lineno() {
-                f.write_str(":")?;
-                fmt::Display::fmt(&lineno, f)?;
-                if let Some(colno) = self.symbol.colno() {
-                    f.write_str(":")?;
-                    fmt::Display::fmt(&colno, f)?;
+            if let Some(lineno) = self.lineno {
+                write!(f, ":{lineno}")?;
+                if let Some(colno) = self.colno {
+                    write!(f, ":{colno}")?;
                 }
             }
         }
