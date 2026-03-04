@@ -3,7 +3,7 @@
 //! See [`Handle::dump`][crate::runtime::Handle::dump].
 
 use crate::task::Id;
-use std::{fmt, future::Future, path::Path};
+use std::{ffi::c_void, fmt, future::Future, path::Path};
 
 pub use crate::runtime::task::trace::Root;
 
@@ -169,18 +169,14 @@ impl Trace {
     /// Returns the raw (unresolved) instruction pointers for each linear
     /// backtrace in this trace, without performing any symbolization.
     ///
-    /// Each inner `Vec<u64>` corresponds to one leaf future's poll backtrace,
+    /// Each inner slice corresponds to one leaf future's poll backtrace,
     /// ordered from innermost frame (closest to the leaf) outward. The
     /// addresses are suitable for offline symbolization (e.g. with `addr2line`
     /// or `blazesym`) after adjusting for the process's load address.
     ///
     /// This method never acquires any lock and performs no I/O.
-    pub fn raw_backtraces(&self) -> Vec<Vec<u64>> {
-        self.inner
-            .backtraces()
-            .iter()
-            .map(|bt| bt.iter().map(|&addr| addr as u64).collect())
-            .collect()
+    pub fn raw_backtraces(&self) -> impl Iterator<Item = &[*mut c_void]> {
+        self.inner.backtraces().iter().map(|bt| bt.as_slice())
     }
 
     /// Resolve and return a list of backtraces that are involved in polls in this trace.
