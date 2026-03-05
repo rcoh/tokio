@@ -3,14 +3,14 @@ use crate::runtime::context;
 use crate::runtime::scheduler::{self, current_thread, Inject};
 use crate::task::Id;
 
-use backtrace::BacktraceFrame;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::ptr::{self, NonNull};
+#[allow(unused_imports)]
+use std::ptr::NonNull;
 use std::task::{self, Poll};
 
 mod symbol;
@@ -21,7 +21,8 @@ use tree::Tree;
 
 use super::{Notified, OwnedTasks, Schedule};
 
-type Backtrace = Vec<BacktraceFrame>;
+/// A raw backtrace captured during stack unwinding.
+type Backtrace = Vec<FrameAddr>;
 type SymbolTrace = Vec<Symbol>;
 
 /// The ambient backtracing context.
@@ -35,11 +36,33 @@ pub(crate) struct Context {
 
 /// A [`Frame`] in an intrusive, doubly-linked tree of [`Frame`]s.
 struct Frame {
-    /// The location associated with this frame.
-    inner_addr: *const c_void,
-
     /// The parent frame, if any.
     parent: Option<NonNull<Frame>>,
+}
+
+/// An tree execution trace.
+///
+/// Traces are captured with [`Trace::capture`], rooted with [`Trace::root`]
+/// and leaved with [`trace_leaf`].
+/// A raw instruction pointer captured during stack unwinding.
+///
+/// This is a code address (not a pointer to data) suitable for passing to
+/// `backtrace::resolve` or offline symbolization tools like `addr2line`.
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
+pub struct FrameAddr(*mut c_void);
+
+// SAFETY: The wrapped pointer is a code address (instruction pointer),
+// not a pointer to owned heap data. Safe to send/share across threads.
+unsafe impl Send for FrameAddr {}
+unsafe impl Sync for FrameAddr {}
+
+impl FrameAddr {
+    /// Returns the raw instruction pointer.
+    #[inline]
+    pub fn addr(self) -> *mut c_void {
+        self.0
+    }
 }
 
 /// An tree execution trace.
@@ -121,12 +144,17 @@ impl Context {
 impl Trace {
     /// Invokes `f`, returning both its result and the collection of backtraces
     /// captured at each sub-invocation of [`trace_leaf`].
+    ///
+    /// Uses frame pointer unwinding to collect stack traces. The binary must
+    /// be compiled with `-C force-frame-pointers=yes` for correct results.
     #[inline(never)]
     pub(crate) fn capture<F, R>(f: F) -> (R, Trace)
     where
         F: FnOnce() -> R,
     {
-        let collector = Trace { backtraces: vec![] };
+        let collector = Trace {
+            backtraces: vec![],
+        };
 
         let previous = Context::with_current_collector(|current| current.replace(Some(collector)));
 
@@ -164,29 +192,13 @@ pub(crate) fn trace_leaf(cx: &mut task::Context<'_>) -> Poll<()> {
     let did_trace = unsafe {
         Context::try_with_current(|context_cell| {
             if let Some(mut collector) = context_cell.collector.take() {
-                let mut frames = vec![];
-                let mut above_leaf = false;
+                let mut frames: Backtrace = vec![];
 
                 if let Some(active_frame) = context_cell.active_frame.get() {
-                    let active_frame = active_frame.as_ref();
-
-                    backtrace::trace(|frame| {
-                        let below_root = !ptr::eq(frame.symbol_address(), active_frame.inner_addr);
-
-                        // only capture frames above `Trace::leaf` and below
-                        // `Trace::root`.
-                        if above_leaf && below_root {
-                            frames.push(frame.to_owned().into());
-                        }
-
-                        if ptr::eq(frame.symbol_address(), trace_leaf as *const _) {
-                            above_leaf = true;
-                        }
-
-                        // only continue unwinding if we're below `Trace::root`
-                        below_root
-                    });
+                    let root_fp = active_frame.as_ptr() as usize;
+                    trace_leaf_fp(&mut frames, root_fp);
                 }
+
                 collector.backtraces.push(frames);
                 context_cell.collector.set(Some(collector));
                 true
@@ -222,6 +234,62 @@ impl fmt::Display for Trace {
     }
 }
 
+/// Walk the stack using frame pointers. Only available on x86_64 and aarch64.
+///
+/// Collects return addresses from the fp chain, skipping the first 2 frames
+/// (trace_leaf_fp and trace_leaf) and stopping when the frame pointer reaches
+/// `root_fp` (the address of the `Frame` struct on `Root::poll`'s stack).
+/// This produces a clean trace containing only user code.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(never)]
+fn trace_leaf_fp(frames: &mut Backtrace, root_fp: usize) {
+    // The number of internal frames to skip at the bottom of the trace:
+    // 0: trace_leaf_fp (this function)
+    // 1: trace_leaf
+    const FRAMES_TO_SKIP: usize = 2;
+
+    unsafe {
+        let mut fp: *const usize;
+        #[cfg(target_arch = "x86_64")]
+        std::arch::asm!("mov {}, rbp", out(reg) fp);
+        #[cfg(target_arch = "aarch64")]
+        std::arch::asm!("mov {}, x29", out(reg) fp);
+
+        let mut i = 0;
+        while !fp.is_null() && fp.is_aligned() {
+            // Stop when we reach or pass the root frame. The Frame struct
+            // lives on Root::poll's stack, so its address is between
+            // Root::poll's fp and sp. Once our fp walk reaches that
+            // region, we've exited user code.
+            if fp as usize >= root_fp {
+                break;
+            }
+
+            let ret_addr = *fp.add(1) as *mut c_void;
+            if ret_addr.is_null() {
+                break;
+            }
+
+            if i >= FRAMES_TO_SKIP {
+                frames.push(FrameAddr(ret_addr));
+            }
+            i += 1;
+
+            let next = *fp as *const usize;
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn trace_leaf_fp(_frames: &mut Backtrace, _root_fp: usize) {
+    // Frame pointer unwinding is not supported on this architecture.
+}
+
+
 fn defer<F: FnOnce() -> R, R>(f: F) -> impl Drop {
     use std::mem::ManuallyDrop;
 
@@ -248,7 +316,6 @@ impl<T: Future> Future for Root<T> {
         // before `frame` is dropped.
         unsafe {
             let mut frame = Frame {
-                inner_addr: Self::poll as *const c_void,
                 parent: None,
             };
 

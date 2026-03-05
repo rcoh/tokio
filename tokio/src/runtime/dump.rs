@@ -5,7 +5,7 @@
 use crate::task::Id;
 use std::{fmt, future::Future, path::Path};
 
-pub use crate::runtime::task::trace::Root;
+pub use crate::runtime::task::trace::{FrameAddr, Root};
 
 /// A snapshot of a runtime's state.
 ///
@@ -57,18 +57,6 @@ pub struct BacktraceSymbol {
 }
 
 impl BacktraceSymbol {
-    pub(crate) fn from_backtrace_symbol(sym: &backtrace::BacktraceSymbol) -> Self {
-        let name = sym.name();
-        Self {
-            name: name.as_ref().map(|name| name.as_bytes().into()),
-            name_demangled: name.map(|name| format!("{name}").into()),
-            addr: sym.addr().map(Address),
-            filename: sym.filename().map(From::from),
-            lineno: sym.lineno(),
-            colno: sym.colno(),
-        }
-    }
-
     /// Return the raw name of the symbol.
     pub fn name_raw(&self) -> Option<&[u8]> {
         self.name.as_deref()
@@ -116,18 +104,6 @@ pub struct BacktraceFrame {
 }
 
 impl BacktraceFrame {
-    pub(crate) fn from_resolved_backtrace_frame(frame: &backtrace::BacktraceFrame) -> Self {
-        Self {
-            ip: Address(frame.ip()),
-            symbol_address: Address(frame.symbol_address()),
-            symbols: frame
-                .symbols()
-                .iter()
-                .map(BacktraceSymbol::from_backtrace_symbol)
-                .collect(),
-        }
-    }
-
     /// Return the instruction pointer of this frame.
     ///
     /// See the ABI docs for your platform for the exact meaning.
@@ -190,6 +166,19 @@ pub struct Trace {
 }
 
 impl Trace {
+    /// Returns the raw (unresolved) instruction pointers for each linear
+    /// backtrace in this trace, without performing any symbolization.
+    ///
+    /// Each inner slice corresponds to one leaf future's poll backtrace,
+    /// ordered from innermost frame (closest to the leaf) outward. The
+    /// addresses are suitable for offline symbolization (e.g. with `addr2line`
+    /// or `blazesym`) after adjusting for the process's load address.
+    ///
+    /// This method never acquires any lock and performs no I/O.
+    pub fn raw_backtraces(&self) -> impl Iterator<Item = &[FrameAddr]> {
+        self.inner.backtraces().iter().map(|bt| bt.as_slice())
+    }
+
     /// Resolve and return a list of backtraces that are involved in polls in this trace.
     ///
     /// The exact backtraces included here are unstable and might change in the future,
@@ -203,16 +192,29 @@ impl Trace {
         self.inner
             .backtraces()
             .iter()
-            .map(|backtrace| {
-                let mut backtrace = backtrace::Backtrace::from(backtrace.clone());
-                backtrace.resolve();
-                Backtrace {
-                    frames: backtrace
-                        .frames()
-                        .iter()
-                        .map(BacktraceFrame::from_resolved_backtrace_frame)
-                        .collect(),
+            .map(|raw_bt| {
+                let mut frames: Vec<BacktraceFrame> = Vec::new();
+                for &addr in raw_bt {
+                    let mut symbols: Vec<BacktraceSymbol> = Vec::new();
+                    backtrace::resolve(addr.addr(), |sym| {
+                        symbols.push(BacktraceSymbol {
+                            name: sym.name().map(|n| n.as_bytes().into()),
+                            name_demangled: sym.name().map(|n| format!("{n}").into()),
+                            addr: sym.addr().map(Address),
+                            filename: sym.filename().map(From::from),
+                            lineno: sym.lineno(),
+                            colno: sym.colno(),
+                        });
+                    });
+                    frames.push(BacktraceFrame {
+                        ip: Address(addr.addr()),
+                        symbol_address: Address(
+                            symbols.first().and_then(|s| s.addr).map_or(addr.addr(), |a| a.0)
+                        ),
+                        symbols: symbols.into_boxed_slice(),
+                    });
                 }
+                Backtrace { frames: frames.into_boxed_slice() }
             })
             .collect()
     }
@@ -225,6 +227,13 @@ impl Trace {
     /// Use [`Handle::dump`] instead if you want to know what *all the tasks* in your program are doing.
     /// Also see [`Handle::dump`] for more documentation about dumps, but unlike [`Handle::dump`], this function
     /// should not be much slower than calling `f` directly.
+    ///
+    /// Uses frame pointer unwinding to collect stack traces. The binary must
+    /// be compiled with `-C force-frame-pointers=yes` for correct results;
+    /// without frame pointers the trace will be empty.
+    ///
+    /// Only supported on x86_64 and aarch64. On other architectures this
+    /// produces empty traces.
     ///
     /// Due to the way tracing is implemented, Tokio leaf futures will usually, instead of doing their
     /// actual work, do the equivalent of a `yield_now` (returning a `Poll::Pending` and scheduling the
