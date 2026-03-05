@@ -228,6 +228,13 @@ impl Trace {
     /// Also see [`Handle::dump`] for more documentation about dumps, but unlike [`Handle::dump`], this function
     /// should not be much slower than calling `f` directly.
     ///
+    /// Uses frame pointer unwinding to collect stack traces. The binary must
+    /// be compiled with `-C force-frame-pointers=yes` for correct results;
+    /// without frame pointers the trace will be empty.
+    ///
+    /// Only supported on x86_64 and aarch64. On other architectures this
+    /// produces empty traces.
+    ///
     /// Due to the way tracing is implemented, Tokio leaf futures will usually, instead of doing their
     /// actual work, do the equivalent of a `yield_now` (returning a `Poll::Pending` and scheduling the
     /// current context for execution), which means forward progress will probably not happen unless
@@ -270,24 +277,6 @@ impl Trace {
         F: FnOnce() -> R,
     {
         let (res, trace) = super::task::trace::Trace::capture(f);
-        (res, Trace { inner: trace })
-    }
-
-    /// Like [`capture`](Self::capture), but uses frame pointer unwinding
-    /// instead of `backtrace::trace`.
-    ///
-    /// This avoids the global lock in backtrace-rs, making it suitable for
-    /// use on every poll in tracing/instrumentation libraries. However, the
-    /// binary **must** be compiled with `-C force-frame-pointers=yes` or the
-    /// trace will be empty.
-    ///
-    /// Only supported on x86_64 and aarch64. On other architectures this
-    /// produces empty traces.
-    pub fn capture_fp<F, R>(f: F) -> (R, Trace)
-    where
-        F: FnOnce() -> R,
-    {
-        let (res, trace) = super::task::trace::Trace::capture_fp(f);
         (res, Trace { inner: trace })
     }
 

@@ -553,6 +553,17 @@ cfg_taskdump! {
         /// split-debuginfo = "off"
         /// ```
         ///
+        /// ## Frame Pointers Must Be Enabled
+        ///
+        /// Task dumps rely on frame pointer unwinding to capture stack traces.
+        /// The application must be compiled with frame pointers enabled, or
+        /// traces will be empty. Add the following to `.cargo/config.toml`:
+        ///
+        /// ```text
+        /// [build]
+        /// rustflags = ["-C", "force-frame-pointers=yes", "--cfg", "tokio_unstable"]
+        /// ```
+        ///
         /// ## Unstable Features
         ///
         /// This functionality is **unstable**, and requires both the
@@ -561,14 +572,14 @@ cfg_taskdump! {
         /// You can do this by setting the `RUSTFLAGS` environment variable
         /// before invoking `cargo`; e.g.:
         /// ```bash
-        /// RUSTFLAGS="--cfg tokio_unstable" cargo run --example dump
+        /// RUSTFLAGS="--cfg tokio_unstable -C force-frame-pointers=yes" cargo run --example dump
         /// ```
         ///
         /// Or by [configuring][cargo-config] `rustflags` in
         /// `.cargo/config.toml`:
         /// ```text
         /// [build]
-        /// rustflags = ["--cfg", "tokio_unstable"]
+        /// rustflags = ["--cfg", "tokio_unstable", "-C", "force-frame-pointers=yes"]
         /// ```
         ///
         /// [cargo-config]:
