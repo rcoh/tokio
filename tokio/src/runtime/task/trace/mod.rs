@@ -3,14 +3,13 @@ use crate::runtime::context;
 use crate::runtime::scheduler::{self, current_thread, Inject};
 use crate::task::Id;
 
-use backtrace::BacktraceFrame;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::ptr::{self, NonNull};
+use std::ptr::NonNull;
 use std::task::{self, Poll};
 
 mod symbol;
@@ -21,7 +20,7 @@ use tree::Tree;
 
 use super::{Notified, OwnedTasks, Schedule};
 
-type Backtrace = Vec<BacktraceFrame>;
+type InternalBacktrace = Vec<backtrace::BacktraceFrame>;
 type SymbolTrace = Vec<Symbol>;
 
 /// The ambient backtracing context.
@@ -29,8 +28,9 @@ pub(crate) struct Context {
     /// The address of [`Trace::root`] establishes an upper unwinding bound on
     /// the backtraces in `Trace`.
     active_frame: Cell<Option<NonNull<Frame>>>,
-    /// The place to stash backtraces.
-    collector: Cell<Option<Trace>>,
+    /// The function to call at each leaf poll point during tracing. allows caching the in progress
+    /// builds which makes iterating slightly less painful
+    poll_leaf: Cell<Option<fn(&TraceMeta)>>,
 }
 
 /// A [`Frame`] in an intrusive, doubly-linked tree of [`Frame`]s.
@@ -42,15 +42,29 @@ struct Frame {
     parent: Option<NonNull<Frame>>,
 }
 
-/// An tree execution trace.
+/// An execution trace of a task's last poll.
 ///
-/// Traces are captured with [`Trace::capture`], rooted with [`Trace::root`]
-/// and leaved with [`trace_leaf`].
+/// <div class="warning">
+///
+/// Resolving a backtrace, either via the [`Display`][std::fmt::Display] impl or via
+/// [`resolve_backtraces`][Trace::resolve_backtraces], parses debuginfo, which is
+/// possibly a CPU-expensive operation that can take a platform-specific but
+/// long time to run - often over 100 milliseconds, especially if the current
+/// process's binary is big. In some cases, the platform might internally cache some of the
+/// debuginfo, so successive calls to `resolve_backtraces` might be faster than
+/// the first call, but all guarantees are platform-dependent.
+///
+/// To avoid blocking the runtime, it is recommended
+/// that you resolve backtraces inside of a [`spawn_blocking()`][crate::task::spawn_blocking]
+/// and to have some concurrency-limiting mechanism to avoid unexpected performance impact.
+/// </div>
+///
+/// See [`Handle::dump`][crate::runtime::Handle::dump].
 #[derive(Clone, Debug)]
-pub(crate) struct Trace {
+pub struct Trace {
     // The linear backtraces that comprise this trace. These linear traces can
     // be re-knitted into a tree.
-    backtraces: Vec<Backtrace>,
+    backtraces: Vec<InternalBacktrace>,
 }
 
 pin_project_lite::pin_project! {
@@ -72,7 +86,7 @@ impl Context {
     pub(crate) const fn new() -> Self {
         Context {
             active_frame: Cell::new(None),
-            collector: Cell::new(None),
+            poll_leaf: Cell::new(None),
         }
     }
 
@@ -96,108 +110,215 @@ impl Context {
         }
     }
 
-    fn with_current_collector<F, R>(f: F) -> R
-    where
-        F: FnOnce(&Cell<Option<Trace>>) -> R,
-    {
-        // SAFETY: This call can only access the collector field, so it cannot
+    /// Produces `true` if the current task is being traced; otherwise false.
+    pub(crate) fn is_tracing() -> bool {
+        // SAFETY: This call can only access the poll_leaf field, so it cannot
         // break the trace frame linked list.
         unsafe {
-            Self::try_with_current(|context| f(&context.collector)).expect(FAIL_NO_THREAD_LOCAL)
+            Self::try_with_current(|context| context.poll_leaf.get().is_some()).unwrap_or(false)
         }
     }
 
-    /// Produces `true` if the current task is being traced; otherwise false.
-    pub(crate) fn is_tracing() -> bool {
-        Self::with_current_collector(|maybe_collector| {
-            let collector = maybe_collector.take();
-            let result = collector.is_some();
-            maybe_collector.set(collector);
-            result
-        })
+    fn with_current_poll_leaf<F, R>(f: F) -> R
+    where
+        F: FnOnce(&Cell<Option<fn(&TraceMeta)>>) -> R,
+    {
+        // SAFETY: This call can only access the poll_leaf field, so it cannot
+        // break the trace frame linked list.
+        unsafe {
+            Self::try_with_current(|context| f(&context.poll_leaf)).expect(FAIL_NO_THREAD_LOCAL)
+        }
     }
 }
 
+/// Metadata passed to the `poll_leaf` callback in [`Trace::capture_with`].
+///
+/// This struct is `#[non_exhaustive]` so that new fields can be added in
+/// the future without breaking existing callers.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct TraceMeta {
+    /// The root boundary address set by [`Root::poll`], if any.
+    ///
+    /// When using `backtrace::trace` or frame-pointer unwinding, this is the
+    /// address at which stack walking should stop. It corresponds to the
+    /// `Root::poll` function pointer.
+    pub root_addr: Option<*const std::ffi::c_void>,
+}
+
+mod trace_impl;
+
+pub use trace_impl::{Backtrace, BacktraceFrame, BacktraceSymbol};
+
 impl Trace {
-    /// Invokes `f`, returning both its result and the collection of backtraces
-    /// captured at each sub-invocation of [`trace_leaf`].
+    /// Runs the function `f` in tracing mode, and returns its result along with the resulting [`Trace`].
+    ///
+    /// This is normally called with `f` being the poll function of a future, and will give you a backtrace
+    /// that tells you what that one future is doing.
+    ///
+    /// Use [`Handle::dump`] instead if you want to know what *all the tasks* in your program are doing.
+    /// Also see [`Handle::dump`] for more documentation about dumps, but unlike [`Handle::dump`], this function
+    /// should not be much slower than calling `f` directly.
+    ///
+    /// Due to the way tracing is implemented, Tokio leaf futures will usually, instead of doing their
+    /// actual work, do the equivalent of a `yield_now` (returning a `Poll::Pending` and scheduling the
+    /// current context for execution), which means forward progress will probably not happen unless
+    /// you eventually call your future outside of `capture`.
+    ///
+    /// [`Handle::dump`]: crate::runtime::Handle::dump
+    ///
+    /// Example usage:
+    /// ```
+    /// use std::future::Future;
+    /// use std::task::Poll;
+    /// use tokio::runtime::dump::Trace;
+    ///
+    /// # async fn test_fn() {
+    /// // some future
+    /// let mut test_future = std::pin::pin!(async move { tokio::task::yield_now().await; 0 });
+    ///
+    /// // trace it once, see what it's doing
+    /// let (trace, res) = Trace::root(std::future::poll_fn(|cx| {
+    ///     let (res, trace) = Trace::capture(|| test_future.as_mut().poll(cx));
+    ///     Poll::Ready((trace, res))
+    /// })).await;
+    ///
+    /// // await it to let it finish, outside of a `capture`
+    /// let output = match res {
+    ///    Poll::Ready(output) => output,
+    ///    Poll::Pending => test_future.await,
+    /// };
+    ///
+    /// println!("{trace}");
+    /// # }
+    /// ```
+    ///
+    /// ### Nested calls
+    ///
+    /// Nested calls to `capture` might return partial traces, but will not do any other undesirable behavior (for
+    /// example, they will not panic).
     #[inline(never)]
-    pub(crate) fn capture<F, R>(f: F) -> (R, Trace)
+    pub fn capture<F, R>(f: F) -> (R, Trace)
     where
         F: FnOnce() -> R,
     {
-        let collector = Trace { backtraces: vec![] };
+        trace_impl::capture(f)
+    }
 
-        let previous = Context::with_current_collector(|current| current.replace(Some(collector)));
+    /// Runs `f` with `poll_leaf` called at each Tokio leaf future poll point.
+    ///
+    /// Unlike [`capture`][Trace::capture], this method does not collect
+    /// backtraces into a [`Trace`]. Instead, the caller provides a `poll_leaf`
+    /// function pointer that is invoked at each leaf poll and is responsible
+    /// for its own state management (e.g. via thread-locals).
+    ///
+    /// The `poll_leaf` function receives a [`TraceMeta`] reference containing
+    /// metadata about the current trace context (e.g. the root boundary address).
+    ///
+    /// While `poll_leaf` is active, every Tokio leaf future will return
+    /// `Poll::Pending` and schedule a wakeup, allowing the caller to observe
+    /// each poll point.
+    ///
+    /// [`Handle::dump`]: crate::runtime::Handle::dump
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::future::Future;
+    /// use std::task::Poll;
+    /// use tokio::runtime::dump::{Trace, TraceMeta};
+    ///
+    /// // Thread-local storage for the custom trace function.
+    /// std::thread_local! {
+    ///     static LEAF_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// }
+    ///
+    /// fn my_trace_leaf(_meta: &TraceMeta) {
+    ///     LEAF_COUNT.with(|c| c.set(c.get() + 1));
+    /// }
+    ///
+    /// # async fn example() {
+    /// let mut fut = std::pin::pin!(async {
+    ///     tokio::task::yield_now().await;
+    /// });
+    ///
+    /// LEAF_COUNT.with(|c| c.set(0));
+    ///
+    /// Trace::root(std::future::poll_fn(|cx| {
+    ///     Trace::capture_with(|| { let _ = fut.as_mut().poll(cx); }, my_trace_leaf);
+    ///     Poll::Ready(())
+    /// })).await;
+    ///
+    /// let count = LEAF_COUNT.with(|c| c.get());
+    /// assert!(count > 0);
+    /// # }
+    /// ```
+    #[inline(never)]
+    pub fn capture_with<F, R>(f: F, poll_leaf: fn(&TraceMeta)) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let previous = Context::with_current_poll_leaf(|current| current.replace(Some(poll_leaf)));
 
         let result = f();
 
-        let collector =
-            Context::with_current_collector(|current| current.replace(previous)).unwrap();
+        Context::with_current_poll_leaf(|current| current.set(previous));
 
-        (result, collector)
+        result
     }
 
-    /// The root of a trace.
-    #[inline(never)]
-    pub(crate) fn root<F>(future: F) -> Root<F> {
-        Root { future }
+    /// Create a root for stack traces captured using [`Trace::capture`]. Stack frames above
+    /// the root will not be captured.
+    ///
+    /// Nesting multiple [`Root`] futures is fine. Captures will stop at the first root. Not having
+    /// a [`Root`] is fine as well, but there is no guarantee on where the capture will stop.
+    pub fn root<F>(f: F) -> Root<F>
+    where
+        F: Future,
+    {
+        Root { future: f }
     }
 
-    pub(crate) fn backtraces(&self) -> &[Backtrace] {
+    pub(crate) fn backtraces(&self) -> &[InternalBacktrace] {
         &self.backtraces
+    }
+
+    fn new() -> Trace {
+        Trace { backtraces: vec![] }
+    }
+
+    fn push_backtrace(&mut self, bt: InternalBacktrace) {
+        self.backtraces.push(bt);
     }
 }
 
-/// If this is a sub-invocation of [`Trace::capture`], capture a backtrace.
+/// If this is a sub-invocation of [`Trace::capture_with`], call the active
+/// `poll_leaf` function.
 ///
-/// The captured backtrace will be returned by [`Trace::capture`].
-///
-/// Invoking this function does nothing when it is not a sub-invocation
-/// [`Trace::capture`].
+/// Invoking this function does nothing when it is not a sub-invocation of
+/// [`Trace::capture_with`].
 // This function is marked `#[inline(never)]` to ensure that it gets a distinct `Frame` in the
 // backtrace, below which frames should not be included in the backtrace (since they reflect the
 // internal implementation details of this crate).
 #[inline(never)]
 pub(crate) fn trace_leaf(cx: &mut task::Context<'_>) -> Poll<()> {
-    // Safety: We don't manipulate the current context's active frame.
-    let did_trace = unsafe {
-        Context::try_with_current(|context_cell| {
-            if let Some(mut collector) = context_cell.collector.take() {
-                let mut frames = vec![];
-                let mut above_leaf = false;
+    let poll_leaf = Context::with_current_poll_leaf(|cell| cell.get());
 
-                if let Some(active_frame) = context_cell.active_frame.get() {
-                    let active_frame = active_frame.as_ref();
+    if let Some(poll_leaf) = poll_leaf {
+        let meta = TraceMeta {
+            // SAFETY: We only read active_frame, we don't modify the linked list.
+            root_addr: unsafe {
+                Context::try_with_current(|ctx| {
+                    ctx.active_frame
+                        .get()
+                        .map(|frame| frame.as_ref().inner_addr)
+                })
+                .flatten()
+            },
+        };
 
-                    backtrace::trace(|frame| {
-                        let below_root = !ptr::eq(frame.symbol_address(), active_frame.inner_addr);
+        poll_leaf(&meta);
 
-                        // only capture frames above `Trace::leaf` and below
-                        // `Trace::root`.
-                        if above_leaf && below_root {
-                            frames.push(frame.to_owned().into());
-                        }
-
-                        if ptr::eq(frame.symbol_address(), trace_leaf as *const _) {
-                            above_leaf = true;
-                        }
-
-                        // only continue unwinding if we're below `Trace::root`
-                        below_root
-                    });
-                }
-                collector.backtraces.push(frames);
-                context_cell.collector.set(Some(collector));
-                true
-            } else {
-                false
-            }
-        })
-        .unwrap_or(false)
-    };
-
-    if did_trace {
         // Use the same logic that `yield_now` uses to send out wakeups after
         // the task yields.
         context::with_scheduler(|scheduler| {
