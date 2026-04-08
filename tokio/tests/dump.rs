@@ -197,3 +197,43 @@ fn notified_during_tracing() {
         );
     });
 }
+
+/// Test that `Trace::capture_with` invokes a custom `poll_leaf` function
+/// at each leaf poll point.
+#[test]
+fn capture_with_custom_poll_leaf() {
+    use std::future::Future;
+    use std::task::Poll;
+    use tokio::runtime::dump::{Trace, TraceMeta};
+
+    std::thread_local! {
+        static CALL_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    fn my_trace_leaf(_meta: &TraceMeta) {
+        CALL_COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    let rt = runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let mut fut = std::pin::pin!(async {
+            tokio::task::yield_now().await;
+        });
+
+        CALL_COUNT.with(|c| c.set(0));
+
+        // capture_with should call my_trace_leaf at the yield_now leaf
+        Trace::root(std::future::poll_fn(|cx| {
+            Trace::capture_with(|| { let _ = fut.as_mut().poll(cx); }, my_trace_leaf);
+            Poll::Ready(())
+        }))
+        .await;
+
+        let count = CALL_COUNT.with(|c| c.get());
+        assert!(count > 0, "custom poll_leaf was never called, count={count}");
+    });
+}

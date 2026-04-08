@@ -2,7 +2,7 @@ use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use super::{Backtrace, Symbol, SymbolTrace, Trace};
+use super::{InternalBacktrace, Symbol, SymbolTrace, Trace};
 
 /// An adjacency list representation of an execution tree.
 ///
@@ -100,9 +100,9 @@ impl fmt::Display for Tree {
 
 /// Resolve a sequence of [`backtrace::BacktraceFrame`]s into a sequence of
 /// [`Symbol`]s.
-fn to_symboltrace(backtrace: Backtrace) -> SymbolTrace {
+fn to_symboltrace(backtrace: InternalBacktrace) -> SymbolTrace {
     // Resolve the backtrace frames to symbols.
-    let backtrace: Backtrace = {
+    let backtrace: InternalBacktrace = {
         let mut backtrace = backtrace::Backtrace::from(backtrace);
         backtrace.resolve();
         backtrace.into()
