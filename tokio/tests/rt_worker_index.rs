@@ -1,5 +1,5 @@
 #![warn(rust_2018_idioms)]
-#![cfg(all(feature = "full", tokio_unstable, not(target_os = "wasi"),))]
+#![cfg(all(feature = "full", not(target_os = "wasi")))]
 
 use tokio::runtime::{self, Runtime};
 
@@ -29,27 +29,28 @@ fn worker_index_outside_runtime() {
     assert_eq!(runtime::worker_index(), None);
 }
 
-#[cfg(target_has_atomic = "64")]
 #[test]
-fn worker_index_matches_metrics_worker_thread_id() {
+fn worker_index_multi_thread() {
     let rt = runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
     let metrics = rt.metrics();
+    let worker_count = metrics.num_workers();
 
     rt.block_on(async {
-        // Spawn a task and verify the worker_index matches the metrics index
         tokio::task::spawn(async move {
             let index = runtime::worker_index().expect("should be on worker thread");
-            let current_thread = std::thread::current().id();
-            let metrics_thread = metrics.worker_thread_id(index);
+            assert!(
+                index < worker_count,
+                "worker_index() returned {index}, but there are only {worker_count} workers"
+            );
+            #[cfg(all(tokio_unstable, target_has_atomic = "64"))]
             assert_eq!(
-                metrics_thread,
-                Some(current_thread),
-                "worker_index() returned {index} but metrics.worker_thread_id({index}) \
-                 does not match current thread"
+                metrics.worker_thread_id(index),
+                Some(std::thread::current().id()),
+                "worker_index() returned {index}, but that worker's thread ID does not match"
             );
         })
         .await
